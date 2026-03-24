@@ -418,6 +418,26 @@ Run tests:
 cargo test
 ```
 
+Run repeatable Postgres/MySQL smoke tests:
+
+```bash
+scripts/smoke-test.sh \
+  --postgres-url postgres://postgres@localhost:5432/testing \
+  --mysql-url mysql://root:root@localhost:3306/testing
+```
+
+Destructive coverage for disposable databases only:
+
+```bash
+scripts/smoke-test.sh \
+  --postgres-url postgres://postgres@localhost:5432/dbrs_smoke \
+  --mysql-url mysql://root:root@localhost:3306/dbrs_smoke \
+  --allow-destructive
+```
+
+The smoke script verifies `migrate`, `status`, `show`, `table`, JSON output, `rollback`, and `reset`.
+With `--allow-destructive`, it also verifies `fresh` and `wipe`.
+
 Run locally:
 
 ```bash

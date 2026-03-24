@@ -1021,7 +1021,7 @@ async fn show_postgres_table(conn: &mut AnyConnection, table: &QualifiedName, ou
 async fn show_mysql(conn: &mut AnyConnection, limit: usize, output: OutputMode) -> Result<()> {
     let row = sqlx::query(
         "SELECT DATABASE() AS database_name, \
-         COALESCE(SUM(data_length + index_length), 0) AS database_size_bytes \
+         CAST(COALESCE(SUM(data_length + index_length), 0) AS SIGNED) AS database_size_bytes \
          FROM information_schema.tables \
          WHERE table_schema = DATABASE()",
     )
@@ -1043,7 +1043,7 @@ async fn show_mysql(conn: &mut AnyConnection, limit: usize, output: OutputMode) 
     let open_connections: i64 = row.try_get("open_connections")?;
 
     let tables = sqlx::query(&format!(
-        "SELECT table_name, COALESCE(data_length + index_length, 0) AS total_bytes \
+        "SELECT table_name, CAST(COALESCE(data_length + index_length, 0) AS SIGNED) AS total_bytes \
          FROM information_schema.tables \
          WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' \
          ORDER BY total_bytes DESC, table_name \
@@ -1114,7 +1114,7 @@ async fn show_mysql_table(conn: &mut AnyConnection, table: &QualifiedName, outpu
     };
 
     let row = sqlx::query(
-        "SELECT COALESCE(table_rows, 0) AS table_rows, COALESCE(data_length + index_length, 0) AS size_bytes \
+        "SELECT CAST(COALESCE(table_rows, 0) AS SIGNED) AS table_rows, CAST(COALESCE(data_length + index_length, 0) AS SIGNED) AS size_bytes \
          FROM information_schema.tables \
          WHERE table_schema = ? AND table_name = ? AND table_type = 'BASE TABLE'"
     )
@@ -1128,7 +1128,7 @@ async fn show_mysql_table(conn: &mut AnyConnection, table: &QualifiedName, outpu
     let size_bytes: i64 = row.try_get("size_bytes")?;
 
     let columns = sqlx::query(
-        "SELECT column_name, column_type, is_nullable, column_default \
+        "SELECT CONCAT(column_name) AS column_name, CONCAT(column_type) AS column_type, is_nullable, IF(column_default IS NULL, NULL, CONCAT(column_default)) AS column_default \
          FROM information_schema.columns \
          WHERE table_schema = ? AND table_name = ? \
          ORDER BY ordinal_position",
@@ -1143,16 +1143,25 @@ async fn show_mysql_table(conn: &mut AnyConnection, table: &QualifiedName, outpu
         .into_iter()
         .map(|row| -> Result<ColumnInfo> {
             Ok(ColumnInfo {
-                name: row.try_get("column_name")?,
-                data_type: row.try_get("column_type")?,
+                name: get_string_like(&row, "column_name")?,
+                data_type: get_string_like(&row, "column_type")?,
                 nullable: row.try_get::<String, _>("is_nullable")? == "YES",
-                default_value: row.try_get("column_default")?,
+                default_value: row
+                    .try_get::<Option<String>, _>("column_default")
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        row.try_get::<Option<Vec<u8>>, _>("column_default")
+                            .ok()
+                            .flatten()
+                            .and_then(|bytes| String::from_utf8(bytes).ok())
+                    }),
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
     let indexes = sqlx::query(
-        "SELECT index_name, non_unique, seq_in_index, column_name \
+        "SELECT CONCAT(index_name) AS index_name, non_unique, seq_in_index, CONCAT(column_name) AS column_name \
          FROM information_schema.statistics \
          WHERE table_schema = ? AND table_name = ? \
          ORDER BY index_name, seq_in_index",
@@ -1517,6 +1526,19 @@ fn extract_index_columns(definition: &str) -> Vec<String> {
         .collect()
 }
 
+fn get_string_like(row: &sqlx::any::AnyRow, field: &str) -> Result<String> {
+    if let Ok(value) = row.try_get::<String, _>(field) {
+        return Ok(value);
+    }
+
+    if let Ok(bytes) = row.try_get::<Vec<u8>, _>(field) {
+        return String::from_utf8(bytes)
+            .with_context(|| format!("failed to decode utf-8 for column `{field}`"));
+    }
+
+    bail!("failed to decode string column `{field}`")
+}
+
 fn group_index_rows(
     rows: Vec<sqlx::any::AnyRow>,
     index_name_field: &str,
@@ -1527,8 +1549,8 @@ fn group_index_rows(
     let mut by_name: HashMap<String, usize> = HashMap::new();
 
     for row in rows {
-        let name: String = row.try_get(index_name_field)?;
-        let column: String = row.try_get(column_name_field)?;
+        let name = get_string_like(&row, index_name_field)?;
+        let column = get_string_like(&row, column_name_field)?;
         let unique = row.try_get::<i64, _>(non_unique_field)? == 0;
 
         if let Some(index) = by_name.get(&name).copied() {
