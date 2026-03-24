@@ -5,6 +5,15 @@ REPO_SLUG="${DBRS_REPO_SLUG:-sawirricardo/dbrs}"
 PACKAGE_NAME="${DBRS_PACKAGE_NAME:-dbrs}"
 RELEASE_TAG="${DBRS_RELEASE_TAG:-stable}"
 BIN_DIR="${DBRS_INSTALL_DIR:-}"
+TMP_DIR=""
+
+cleanup() {
+  if [[ -n "${TMP_DIR:-}" ]]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+}
+
+trap cleanup EXIT
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -146,25 +155,24 @@ main() {
     download_url="https://github.com/${REPO_SLUG}/releases/download/${RELEASE_TAG}/${asset_name}"
   fi
 
-  local tmp_dir archive_path binary_path install_name
-  tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
-  archive_path="$tmp_dir/$asset_name"
+  local archive_path binary_path install_name
+  TMP_DIR="$(mktemp -d)"
+  archive_path="$TMP_DIR/$asset_name"
   install_name="$PACKAGE_NAME"
-  binary_path="$tmp_dir/$binary_name"
+  binary_path="$TMP_DIR/$binary_name"
 
   echo "Downloading ${asset_name} from ${download_url}"
   download "$download_url" "$archive_path"
 
   case "$archive_ext" in
     tar.gz)
-      tar -xzf "$archive_path" -C "$tmp_dir"
+      tar -xzf "$archive_path" -C "$TMP_DIR"
       ;;
     zip)
       need_cmd unzip
-      unzip -q "$archive_path" -d "$tmp_dir"
+      unzip -q "$archive_path" -d "$TMP_DIR"
       install_name="${PACKAGE_NAME}.exe"
-      binary_path="$tmp_dir/${PACKAGE_NAME}.exe"
+      binary_path="$TMP_DIR/${PACKAGE_NAME}.exe"
       ;;
     *)
       echo "error: unsupported archive format: $archive_ext" >&2
