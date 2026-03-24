@@ -1078,13 +1078,26 @@ async fn fresh(dir: Option<PathBuf>, database_url: &str, yes: bool) -> Result<()
 }
 
 async fn connect(database_url: &str) -> Result<AnyConnection> {
-    AnyConnection::connect(database_url)
+    let normalized_url = normalize_database_url(database_url);
+
+    AnyConnection::connect(&normalized_url)
         .await
         .with_context(|| format!("failed to connect to database at {database_url}"))
 }
 
+fn normalize_database_url(database_url: &str) -> String {
+    if let Some(rest) = database_url.strip_prefix("pgsql://") {
+        return format!("postgres://{rest}");
+    }
+
+    database_url.to_owned()
+}
+
 fn detect_backend(database_url: &str) -> Result<DatabaseBackend> {
-    if database_url.starts_with("postgres://") || database_url.starts_with("postgresql://") {
+    if database_url.starts_with("postgres://")
+        || database_url.starts_with("postgresql://")
+        || database_url.starts_with("pgsql://")
+    {
         return Ok(DatabaseBackend::Postgres);
     }
 
@@ -1692,6 +1705,14 @@ mod tests {
     fn detects_database_backends() {
         assert_eq!(
             detect_backend("postgres://localhost/db").expect("postgres should parse"),
+            DatabaseBackend::Postgres
+        );
+        assert_eq!(
+            detect_backend("postgresql://localhost/db").expect("postgresql should parse"),
+            DatabaseBackend::Postgres
+        );
+        assert_eq!(
+            detect_backend("pgsql://localhost/db").expect("pgsql should parse"),
             DatabaseBackend::Postgres
         );
         assert_eq!(
