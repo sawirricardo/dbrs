@@ -18,6 +18,7 @@ It creates timestamped migration files, applies pending migrations, tracks appli
 - `fresh` to wipe and then re-run all migrations
 - Streamed progress output for `migrate`, `rollback`, `reset`, `wipe`, and `fresh`
 - Global `--quiet` / `-q` flag for summary-only output
+- Global `--json` flag for NDJSON event output in CI/agents
 - `.env` support, including custom env file paths
 - Configurable migration directory and migration table name
 - Opt-in table scaffolding for `create_*` migrations
@@ -154,11 +155,14 @@ Global options:
 
 - `--env-file <ENV_FILE>` or `DBRS_ENV_FILE`
 - `--quiet` or `-q` to suppress streamed progress output and show only summaries/errors
+- `--json` for newline-delimited JSON event output on stdout for CI/agents
+- `--quiet` and `--json` are mutually exclusive
 
 Progress output:
 
 - `migrate`, `rollback`, `reset`, `wipe`, and `fresh` print live progress by default
 - use `--quiet` for summary-only output
+- use `--json` for machine-readable NDJSON events
 
 Create a migration:
 
@@ -185,6 +189,7 @@ Options:
 - `--env-file <ENV_FILE>` or `DBRS_ENV_FILE`
 - `--database-url <DATABASE_URL>` or `DATABASE_URL`
 - `--quiet` or `-q`
+- `--json`
 
 Example output:
 
@@ -198,11 +203,24 @@ Applied 2 migration(s).
 Total migrate time: 0.05s
 ```
 
+Example JSON output:
+
+```text
+{"event":"start","command":"migrate","pending":2}
+{"event":"migration_started","command":"migrate","index":1,"total":2,"version":"2026_03_24_120000","name":"create-users"}
+{"event":"migration_finished","command":"migrate","index":1,"total":2,"version":"2026_03_24_120000","name":"create-users","duration_seconds":0.030000}
+{"event":"summary","command":"migrate","applied":2,"duration_seconds":0.050000}
+```
+
 Show status:
 
 ```bash
 dbrs status --database-url <DATABASE_URL>
 ```
+
+Options:
+
+- `--json`
 
 Output states:
 
@@ -210,6 +228,13 @@ Output states:
 - `PENDING`
 - `APPLIED_MODIFIED`
 - `MISSING_FILE`
+
+Example JSON output:
+
+```text
+{"event":"migration","command":"status","state":"APPLIED","version":"2026_03_24_120000","name":"create-users"}
+{"event":"summary","command":"status","count":1}
+```
 
 Show database info:
 
@@ -221,11 +246,33 @@ Options:
 
 - `--database-url <DATABASE_URL>` or `DATABASE_URL`
 - `--limit <N>` for the number of tables to print, default `20`
+- `--json`
+
+Example JSON output:
+
+```text
+{"event":"database_info","command":"show","backend":"postgres","database":"my_app","current_schema":"public","database_size_bytes":123456,"open_connections":2,"schemas":["public"]}
+{"event":"table_size","command":"show","name":"public.users","size_bytes":8192}
+{"event":"summary","command":"show","count":1}
+```
 
 Inspect one table:
 
 ```bash
 dbrs table users --database-url <DATABASE_URL>
+```
+
+Options:
+
+- `--json`
+
+Example JSON output:
+
+```text
+{"event":"table_info","command":"table","backend":"postgres","database":"my_app","table":"public.users","estimated_rows":42,"size_bytes":8192}
+{"event":"column","command":"table","table":"public.users","name":"id","data_type":"bigint","nullable":false,"default":null}
+{"event":"index","command":"table","table":"public.users","name":"users_pkey","unique":true,"columns":["id"]}
+{"event":"summary","command":"table","columns":1,"indexes":1}
 ```
 
 The table name can be either:
@@ -242,6 +289,7 @@ dbrs rollback --database-url <DATABASE_URL> --steps 3 --yes
 Options:
 
 - `--quiet` or `-q`
+- `--json`
 
 Roll back until a specific migration version remains applied:
 
@@ -258,6 +306,7 @@ dbrs reset --database-url <DATABASE_URL> --yes
 Options:
 
 - `--quiet` or `-q`
+- `--json`
 
 Wipe the current database contents:
 
@@ -268,6 +317,7 @@ dbrs wipe --database-url <DATABASE_URL> --yes
 Options:
 
 - `--quiet` or `-q`
+- `--json`
 
 Fresh database from migrations:
 
@@ -278,6 +328,7 @@ dbrs fresh --database-url <DATABASE_URL> --yes
 Options:
 
 - `--quiet` or `-q`
+- `--json`
 
 ## Environment
 

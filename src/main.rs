@@ -26,8 +26,10 @@ const MIGRATION_TABLE_ENV: &str = "DBRS_MIGRATION_TABLE";
 struct Cli {
     #[arg(long, global = true, env = ENV_FILE_ENV)]
     env_file: Option<PathBuf>,
-    #[arg(long, short = 'q', global = true)]
+    #[arg(long, short = 'q', global = true, conflicts_with = "json")]
     quiet: bool,
+    #[arg(long, global = true, conflicts_with = "quiet")]
+    json: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -135,6 +137,66 @@ struct AppliedMigration {
     checksum: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Human,
+    Quiet,
+    Json,
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+fn json_str_field(key: &str, value: &str) -> String {
+    format!("\"{}\":\"{}\"", json_escape(key), json_escape(value))
+}
+
+fn json_usize_field(key: &str, value: usize) -> String {
+    format!("\"{}\":{}", json_escape(key), value)
+}
+
+fn json_f64_field(key: &str, value: f64) -> String {
+    format!("\"{}\":{value:.6}", json_escape(key))
+}
+
+fn json_i64_field(key: &str, value: i64) -> String {
+    format!("\"{}\":{value}", json_escape(key))
+}
+
+fn json_bool_field(key: &str, value: bool) -> String {
+    format!("\"{}\":{}", json_escape(key), value)
+}
+
+fn json_null_field(key: &str) -> String {
+    format!("\"{}\":null", json_escape(key))
+}
+
+fn json_string_array_field(key: &str, values: &[String]) -> String {
+    let values = values
+        .iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("\"{}\":[{}]", json_escape(key), values)
+}
+
+fn print_json_event(fields: Vec<String>) {
+    println!("{{{}}}", fields.join(","));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     install_default_drivers();
@@ -142,7 +204,13 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let _ = cli.env_file.as_ref();
-    let quiet = cli.quiet;
+    let output = if cli.json {
+        OutputMode::Json
+    } else if cli.quiet {
+        OutputMode::Quiet
+    } else {
+        OutputMode::Human
+    };
 
     match cli.command {
         Commands::New {
@@ -151,31 +219,31 @@ async fn main() -> Result<()> {
             table,
             backend,
         } => create_new_migration(dir, &name, table, backend)?,
-        Commands::Migrate { dir, database_url } => migrate(dir, &database_url, quiet).await?,
-        Commands::Status { dir, database_url } => status(dir, &database_url).await?,
+        Commands::Migrate { dir, database_url } => migrate(dir, &database_url, output).await?,
+        Commands::Status { dir, database_url } => status(dir, &database_url, output).await?,
         Commands::Show {
             database_url,
             limit,
-        } => show(&database_url, limit).await?,
-        Commands::Table { name, database_url } => table(&name, &database_url).await?,
+        } => show(&database_url, limit, output).await?,
+        Commands::Table { name, database_url } => table(&name, &database_url, output).await?,
         Commands::Fresh {
             dir,
             database_url,
             yes,
-        } => fresh(dir, &database_url, yes, quiet).await?,
-        Commands::Wipe { database_url, yes } => wipe(&database_url, yes, quiet).await?,
+        } => fresh(dir, &database_url, yes, output).await?,
+        Commands::Wipe { database_url, yes } => wipe(&database_url, yes, output).await?,
         Commands::Rollback {
             dir,
             database_url,
             steps,
             to,
             yes,
-        } => rollback(dir, &database_url, steps, to, yes, quiet).await?,
+        } => rollback(dir, &database_url, steps, to, yes, output).await?,
         Commands::Reset {
             dir,
             database_url,
             yes,
-        } => reset(dir, &database_url, yes, quiet).await?,
+        } => reset(dir, &database_url, yes, output).await?,
     }
 
     Ok(())
@@ -300,13 +368,14 @@ fn create_new_migration(
     Ok(())
 }
 
-async fn migrate(dir: Option<PathBuf>, database_url: &str, quiet: bool) -> Result<()> {
+async fn migrate(dir: Option<PathBuf>, database_url: &str, output: OutputMode) -> Result<()> {
     let total_started_at = Instant::now();
     let migrations = load_migrations(dir)?;
+    let backend = detect_backend(database_url)?;
     let mut conn = connect(database_url).await?;
     let migration_table = resolve_migration_table_name()?;
 
-    ensure_migration_table(&mut conn, &migration_table).await?;
+    ensure_migration_table(&mut conn, &migration_table, backend).await?;
     let applied = load_applied_migrations(&mut conn, &migration_table).await?;
 
     let pending = migrations
@@ -315,12 +384,26 @@ async fn migrate(dir: Option<PathBuf>, database_url: &str, quiet: bool) -> Resul
         .count();
 
     if pending == 0 {
-        println!("No pending migrations.");
+        match output {
+            OutputMode::Json => print_json_event(vec![
+                json_str_field("event", "summary"),
+                json_str_field("command", "migrate"),
+                json_usize_field("applied", 0),
+                json_f64_field("duration_seconds", total_started_at.elapsed().as_secs_f64()),
+            ]),
+            _ => println!("No pending migrations."),
+        }
         return Ok(());
     }
 
-    if !quiet {
-        println!("Running {pending} pending migration(s)...");
+    match output {
+        OutputMode::Human => println!("Running {pending} pending migration(s)..."),
+        OutputMode::Json => print_json_event(vec![
+            json_str_field("event", "start"),
+            json_str_field("command", "migrate"),
+            json_usize_field("pending", pending),
+        ]),
+        OutputMode::Quiet => {}
     }
 
     let mut applied_now = 0usize;
@@ -337,37 +420,66 @@ async fn migrate(dir: Option<PathBuf>, database_url: &str, quiet: bool) -> Resul
         }
 
         let current = applied_now + 1;
-        if !quiet {
-            println!(
+        match output {
+            OutputMode::Human => println!(
                 "[{current}/{pending}] Running {} ({})...",
                 migration.version, migration.name
-            );
+            ),
+            OutputMode::Json => print_json_event(vec![
+                json_str_field("event", "migration_started"),
+                json_str_field("command", "migrate"),
+                json_usize_field("index", current),
+                json_usize_field("total", pending),
+                json_str_field("version", &migration.version),
+                json_str_field("name", &migration.name),
+            ]),
+            OutputMode::Quiet => {}
         }
         let started_at = Instant::now();
         apply_migration(&mut conn, &migration_table, &migration).await?;
         applied_now += 1;
-        if !quiet {
-            println!(
+        match output {
+            OutputMode::Human => println!(
                 "[{current}/{pending}] Done {} ({}) in {:.2}s",
                 migration.version,
                 migration.name,
                 started_at.elapsed().as_secs_f64()
-            );
+            ),
+            OutputMode::Json => print_json_event(vec![
+                json_str_field("event", "migration_finished"),
+                json_str_field("command", "migrate"),
+                json_usize_field("index", current),
+                json_usize_field("total", pending),
+                json_str_field("version", &migration.version),
+                json_str_field("name", &migration.name),
+                json_f64_field("duration_seconds", started_at.elapsed().as_secs_f64()),
+            ]),
+            OutputMode::Quiet => {}
         }
     }
 
-    println!("Applied {applied_now} migration(s).");
-    println!("Total migrate time: {:.2}s", total_started_at.elapsed().as_secs_f64());
+    match output {
+        OutputMode::Json => print_json_event(vec![
+            json_str_field("event", "summary"),
+            json_str_field("command", "migrate"),
+            json_usize_field("applied", applied_now),
+            json_f64_field("duration_seconds", total_started_at.elapsed().as_secs_f64()),
+        ]),
+        _ => {
+            println!("Applied {applied_now} migration(s).");
+            println!("Total migrate time: {:.2}s", total_started_at.elapsed().as_secs_f64());
+        }
+    }
 
     Ok(())
 }
 
-async fn reset(dir: Option<PathBuf>, database_url: &str, yes: bool, quiet: bool) -> Result<()> {
+async fn reset(dir: Option<PathBuf>, database_url: &str, yes: bool, output: OutputMode) -> Result<()> {
     if !yes {
         bail!("reset is destructive; re-run with `--yes` to confirm");
     }
 
-    run_rollbacks(dir, database_url, RollbackTarget::All, "reset", quiet).await
+    run_rollbacks(dir, database_url, RollbackTarget::All, "reset", output).await
 }
 
 #[derive(Debug, Clone)]
@@ -383,7 +495,7 @@ async fn rollback(
     steps: Option<usize>,
     to: Option<String>,
     yes: bool,
-    quiet: bool,
+    output: OutputMode,
 ) -> Result<()> {
     if !yes {
         bail!("rollback is destructive; re-run with `--yes` to confirm");
@@ -397,7 +509,7 @@ async fn rollback(
         (Some(_), Some(_)) => bail!("use either `--steps` or `--to`, not both"),
     };
 
-    run_rollbacks(dir, database_url, target, "roll back", quiet).await
+    run_rollbacks(dir, database_url, target, "roll back", output).await
 }
 
 async fn run_rollbacks(
@@ -405,7 +517,7 @@ async fn run_rollbacks(
     database_url: &str,
     target: RollbackTarget,
     verb: &str,
-    quiet: bool,
+    output: OutputMode,
 ) -> Result<()> {
     let total_started_at = Instant::now();
     let migrations = load_migrations(dir)?;
@@ -414,17 +526,28 @@ async fn run_rollbacks(
         .map(|migration| (migration.version.clone(), migration))
         .collect();
 
+    let backend = detect_backend(database_url)?;
     let mut conn = connect(database_url).await?;
     let migration_table = resolve_migration_table_name()?;
-    ensure_migration_table(&mut conn, &migration_table).await?;
+    ensure_migration_table(&mut conn, &migration_table, backend).await?;
 
     let applied = load_applied_migration_history(&mut conn, &migration_table).await?;
 
     if applied.is_empty() {
-        if matches!(target, RollbackTarget::All) {
-            println!("No applied migrations to reset.");
-        } else {
-            println!("No applied migrations to roll back.");
+        match output {
+            OutputMode::Json => print_json_event(vec![
+                json_str_field("event", "summary"),
+                json_str_field("command", verb),
+                json_usize_field("rolled_back", 0),
+                json_f64_field("duration_seconds", total_started_at.elapsed().as_secs_f64()),
+            ]),
+            _ => {
+                if matches!(target, RollbackTarget::All) {
+                    println!("No applied migrations to reset.");
+                } else {
+                    println!("No applied migrations to roll back.");
+                }
+            }
         }
         return Ok(());
     }
@@ -433,16 +556,32 @@ async fn run_rollbacks(
     let total = selected.len();
 
     if total == 0 {
-        if matches!(target, RollbackTarget::ToVersion(_)) {
-            println!("No migrations need to be rolled back.");
-        } else {
-            println!("No applied migrations to {verb}.");
+        match output {
+            OutputMode::Json => print_json_event(vec![
+                json_str_field("event", "summary"),
+                json_str_field("command", verb),
+                json_usize_field("rolled_back", 0),
+                json_f64_field("duration_seconds", total_started_at.elapsed().as_secs_f64()),
+            ]),
+            _ => {
+                if matches!(target, RollbackTarget::ToVersion(_)) {
+                    println!("No migrations need to be rolled back.");
+                } else {
+                    println!("No applied migrations to {verb}.");
+                }
+            }
         }
         return Ok(());
     }
 
-    if !quiet {
-        println!("Running {total} rollback migration(s)...");
+    match output {
+        OutputMode::Human => println!("Running {total} rollback migration(s)..."),
+        OutputMode::Json => print_json_event(vec![
+            json_str_field("event", "start"),
+            json_str_field("command", verb),
+            json_usize_field("total", total),
+        ]),
+        OutputMode::Quiet => {}
     }
 
     let mut rolled_back = 0usize;
@@ -465,27 +604,56 @@ async fn run_rollbacks(
         }
 
         let current = rolled_back + 1;
-        if !quiet {
-            println!(
+        match output {
+            OutputMode::Human => println!(
                 "[{current}/{total}] Rolling back {} ({})...",
                 migration.version, migration.name
-            );
+            ),
+            OutputMode::Json => print_json_event(vec![
+                json_str_field("event", "migration_started"),
+                json_str_field("command", verb),
+                json_usize_field("index", current),
+                json_usize_field("total", total),
+                json_str_field("version", &migration.version),
+                json_str_field("name", &migration.name),
+            ]),
+            OutputMode::Quiet => {}
         }
         let started_at = Instant::now();
         rollback_migration(&mut conn, &migration_table, migration).await?;
         rolled_back += 1;
-        if !quiet {
-            println!(
+        match output {
+            OutputMode::Human => println!(
                 "[{current}/{total}] Done {} ({}) in {:.2}s",
                 migration.version,
                 migration.name,
                 started_at.elapsed().as_secs_f64()
-            );
+            ),
+            OutputMode::Json => print_json_event(vec![
+                json_str_field("event", "migration_finished"),
+                json_str_field("command", verb),
+                json_usize_field("index", current),
+                json_usize_field("total", total),
+                json_str_field("version", &migration.version),
+                json_str_field("name", &migration.name),
+                json_f64_field("duration_seconds", started_at.elapsed().as_secs_f64()),
+            ]),
+            OutputMode::Quiet => {}
         }
     }
 
-    println!("Completed {verb}: reverted {rolled_back} migration(s).");
-    println!("Total {verb} time: {:.2}s", total_started_at.elapsed().as_secs_f64());
+    match output {
+        OutputMode::Json => print_json_event(vec![
+            json_str_field("event", "summary"),
+            json_str_field("command", verb),
+            json_usize_field("rolled_back", rolled_back),
+            json_f64_field("duration_seconds", total_started_at.elapsed().as_secs_f64()),
+        ]),
+        _ => {
+            println!("Completed {verb}: reverted {rolled_back} migration(s).");
+            println!("Total {verb} time: {:.2}s", total_started_at.elapsed().as_secs_f64());
+        }
+    }
 
     Ok(())
 }
@@ -507,18 +675,28 @@ fn select_rollbacks(
     }
 }
 
-async fn status(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
+async fn status(dir: Option<PathBuf>, database_url: &str, output: OutputMode) -> Result<()> {
     let migrations = load_migrations(dir)?;
+    let backend = detect_backend(database_url)?;
     let mut conn = connect(database_url).await?;
     let migration_table = resolve_migration_table_name()?;
 
-    ensure_migration_table(&mut conn, &migration_table).await?;
+    ensure_migration_table(&mut conn, &migration_table, backend).await?;
     let applied = load_applied_migrations(&mut conn, &migration_table).await?;
 
     if migrations.is_empty() && applied.is_empty() {
-        println!("No migrations found.");
+        match output {
+            OutputMode::Json => print_json_event(vec![
+                json_str_field("event", "summary"),
+                json_str_field("command", "status"),
+                json_usize_field("count", 0),
+            ]),
+            _ => println!("No migrations found."),
+        }
         return Ok(());
     }
+
+    let mut emitted = 0usize;
 
     for migration in &migrations {
         let state = match applied.get(&migration.version) {
@@ -527,7 +705,17 @@ async fn status(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
             None => "PENDING",
         };
 
-        println!("{state}\t{}\t{}", migration.version, migration.name);
+        match output {
+            OutputMode::Json => print_json_event(vec![
+                json_str_field("event", "migration"),
+                json_str_field("command", "status"),
+                json_str_field("state", state),
+                json_str_field("version", &migration.version),
+                json_str_field("name", &migration.name),
+            ]),
+            _ => println!("{state}\t{}\t{}", migration.version, migration.name),
+        }
+        emitted += 1;
     }
 
     let mut missing_versions = applied
@@ -542,13 +730,31 @@ async fn status(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
     missing_versions.sort();
 
     for version in missing_versions {
-        println!("MISSING_FILE\t{version}\t<applied but no local file>");
+        match output {
+            OutputMode::Json => print_json_event(vec![
+                json_str_field("event", "migration"),
+                json_str_field("command", "status"),
+                json_str_field("state", "MISSING_FILE"),
+                json_str_field("version", &version),
+                json_str_field("name", "<applied but no local file>"),
+            ]),
+            _ => println!("MISSING_FILE\t{version}\t<applied but no local file>"),
+        }
+        emitted += 1;
+    }
+
+    if matches!(output, OutputMode::Json) {
+        print_json_event(vec![
+            json_str_field("event", "summary"),
+            json_str_field("command", "status"),
+            json_usize_field("count", emitted),
+        ]);
     }
 
     Ok(())
 }
 
-async fn show(database_url: &str, limit: usize) -> Result<()> {
+async fn show(database_url: &str, limit: usize, output: OutputMode) -> Result<()> {
     if limit == 0 {
         bail!("show limit must be at least 1");
     }
@@ -556,28 +762,28 @@ async fn show(database_url: &str, limit: usize) -> Result<()> {
     let mut conn = connect(database_url).await?;
 
     match detect_backend(database_url)? {
-        DatabaseBackend::Postgres => show_postgres(&mut conn, limit).await?,
-        DatabaseBackend::MySql => show_mysql(&mut conn, limit).await?,
-        DatabaseBackend::Sqlite => show_sqlite(&mut conn, limit).await?,
+        DatabaseBackend::Postgres => show_postgres(&mut conn, limit, output).await?,
+        DatabaseBackend::MySql => show_mysql(&mut conn, limit, output).await?,
+        DatabaseBackend::Sqlite => show_sqlite(&mut conn, limit, output).await?,
     }
 
     Ok(())
 }
 
-async fn table(name: &str, database_url: &str) -> Result<()> {
+async fn table(name: &str, database_url: &str, output: OutputMode) -> Result<()> {
     let table = parse_qualified_name(name)?;
     let mut conn = connect(database_url).await?;
 
     match detect_backend(database_url)? {
-        DatabaseBackend::Postgres => show_postgres_table(&mut conn, &table).await?,
-        DatabaseBackend::MySql => show_mysql_table(&mut conn, &table).await?,
-        DatabaseBackend::Sqlite => show_sqlite_table(&mut conn, &table).await?,
+        DatabaseBackend::Postgres => show_postgres_table(&mut conn, &table, output).await?,
+        DatabaseBackend::MySql => show_mysql_table(&mut conn, &table, output).await?,
+        DatabaseBackend::Sqlite => show_sqlite_table(&mut conn, &table, output).await?,
     }
 
     Ok(())
 }
 
-async fn show_postgres(conn: &mut AnyConnection, limit: usize) -> Result<()> {
+async fn show_postgres(conn: &mut AnyConnection, limit: usize, output: OutputMode) -> Result<()> {
     let row = sqlx::query(
         "SELECT current_database()::text AS database_name, current_schema()::text AS schema_name, pg_database_size(current_database()) AS database_size_bytes"
     )
@@ -633,25 +839,54 @@ async fn show_postgres(conn: &mut AnyConnection, limit: usize) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    println!("Backend: postgres");
-    println!("Database: {database_name}");
-    println!("Current schema: {schema_name}");
-    println!("Database size: {}", humanize_bytes(database_size_bytes));
-    println!("Open connections: {open_connections}");
-    println!(
-        "Schemas: {}",
-        if schemas.is_empty() {
-            "<none>".to_string()
-        } else {
-            schemas.join(", ")
+    match output {
+        OutputMode::Json => {
+            print_json_event(vec![
+                json_str_field("event", "database_info"),
+                json_str_field("command", "show"),
+                json_str_field("backend", "postgres"),
+                json_str_field("database", &database_name),
+                json_str_field("current_schema", &schema_name),
+                json_i64_field("database_size_bytes", database_size_bytes),
+                json_i64_field("open_connections", i64::from(open_connections)),
+                json_string_array_field("schemas", &schemas),
+            ]);
+            for table in &tables {
+                print_json_event(vec![
+                    json_str_field("event", "table_size"),
+                    json_str_field("command", "show"),
+                    json_str_field("name", &table.name),
+                    json_i64_field("size_bytes", table.size_bytes.unwrap_or(0)),
+                ]);
+            }
+            print_json_event(vec![
+                json_str_field("event", "summary"),
+                json_str_field("command", "show"),
+                json_usize_field("count", tables.len()),
+            ]);
         }
-    );
-    print_table_sizes("Largest tables", &tables);
+        _ => {
+            println!("Backend: postgres");
+            println!("Database: {database_name}");
+            println!("Current schema: {schema_name}");
+            println!("Database size: {}", humanize_bytes(database_size_bytes));
+            println!("Open connections: {open_connections}");
+            println!(
+                "Schemas: {}",
+                if schemas.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    schemas.join(", ")
+                }
+            );
+            print_table_sizes("Largest tables", &tables);
+        }
+    }
 
     Ok(())
 }
 
-async fn show_postgres_table(conn: &mut AnyConnection, table: &QualifiedName) -> Result<()> {
+async fn show_postgres_table(conn: &mut AnyConnection, table: &QualifiedName, output: OutputMode) -> Result<()> {
     let row =
         sqlx::query("SELECT current_database()::text AS database_name, current_schema()::text AS schema_name")
             .fetch_one(&mut *conn)
@@ -725,18 +960,65 @@ async fn show_postgres_table(conn: &mut AnyConnection, table: &QualifiedName) ->
         })
         .collect::<Result<Vec<_>>>()?;
 
-    println!("Backend: postgres");
-    println!("Database: {database_name}");
-    println!("Table: {schema}.{}", table.name);
-    println!("Estimated rows: {estimated_rows}");
-    println!("Table size: {}", humanize_bytes(size_bytes));
-    print_columns(&columns);
-    print_indexes(&indexes);
+    match output {
+        OutputMode::Json => {
+            print_json_event(vec![
+                json_str_field("event", "table_info"),
+                json_str_field("command", "table"),
+                json_str_field("backend", "postgres"),
+                json_str_field("database", &database_name),
+                json_str_field("table", &format!("{schema}.{}", table.name)),
+                json_i64_field("estimated_rows", estimated_rows),
+                json_i64_field("size_bytes", size_bytes),
+            ]);
+            for column in &columns {
+                let mut fields = vec![
+                    json_str_field("event", "column"),
+                    json_str_field("command", "table"),
+                    json_str_field("table", &format!("{schema}.{}", table.name)),
+                    json_str_field("name", &column.name),
+                    json_str_field("data_type", &column.data_type),
+                    json_bool_field("nullable", column.nullable),
+                ];
+                if let Some(default_value) = &column.default_value {
+                    fields.push(json_str_field("default", default_value));
+                } else {
+                    fields.push(json_null_field("default"));
+                }
+                print_json_event(fields);
+            }
+            for index in &indexes {
+                print_json_event(vec![
+                    json_str_field("event", "index"),
+                    json_str_field("command", "table"),
+                    json_str_field("table", &format!("{schema}.{}", table.name)),
+                    json_str_field("name", &index.name),
+                    json_bool_field("unique", index.unique),
+                    json_string_array_field("columns", &index.columns),
+                ]);
+            }
+            print_json_event(vec![
+                json_str_field("event", "summary"),
+                json_str_field("command", "table"),
+                json_usize_field("columns", columns.len()),
+                json_usize_field("indexes", indexes.len()),
+            ]);
+        }
+        _ => {
+            println!("Backend: postgres");
+            println!("Database: {database_name}");
+            println!("Table: {schema}.{}", table.name);
+            println!("Estimated rows: {estimated_rows}");
+            println!("Table size: {}", humanize_bytes(size_bytes));
+            print_columns(&columns);
+            print_indexes(&indexes);
+        }
+    }
 
     Ok(())
 }
 
-async fn show_mysql(conn: &mut AnyConnection, limit: usize) -> Result<()> {
+async fn show_mysql(conn: &mut AnyConnection, limit: usize, output: OutputMode) -> Result<()> {
     let row = sqlx::query(
         "SELECT DATABASE() AS database_name, \
          COALESCE(SUM(data_length + index_length), 0) AS database_size_bytes \
@@ -781,16 +1063,43 @@ async fn show_mysql(conn: &mut AnyConnection, limit: usize) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    println!("Backend: mysql");
-    println!("Database: {database_name}");
-    println!("Database size: {}", humanize_bytes(database_size_bytes));
-    println!("Open connections: {open_connections}");
-    print_table_sizes("Largest tables", &tables);
+    match output {
+        OutputMode::Json => {
+            print_json_event(vec![
+                json_str_field("event", "database_info"),
+                json_str_field("command", "show"),
+                json_str_field("backend", "mysql"),
+                json_str_field("database", &database_name),
+                json_i64_field("database_size_bytes", database_size_bytes),
+                json_i64_field("open_connections", open_connections),
+            ]);
+            for table in &tables {
+                print_json_event(vec![
+                    json_str_field("event", "table_size"),
+                    json_str_field("command", "show"),
+                    json_str_field("name", &table.name),
+                    json_i64_field("size_bytes", table.size_bytes.unwrap_or(0)),
+                ]);
+            }
+            print_json_event(vec![
+                json_str_field("event", "summary"),
+                json_str_field("command", "show"),
+                json_usize_field("count", tables.len()),
+            ]);
+        }
+        _ => {
+            println!("Backend: mysql");
+            println!("Database: {database_name}");
+            println!("Database size: {}", humanize_bytes(database_size_bytes));
+            println!("Open connections: {open_connections}");
+            print_table_sizes("Largest tables", &tables);
+        }
+    }
 
     Ok(())
 }
 
-async fn show_mysql_table(conn: &mut AnyConnection, table: &QualifiedName) -> Result<()> {
+async fn show_mysql_table(conn: &mut AnyConnection, table: &QualifiedName, output: OutputMode) -> Result<()> {
     let database_name = table.schema.clone().unwrap_or_else(|| "".to_string());
 
     let database_name = if database_name.is_empty() {
@@ -855,18 +1164,66 @@ async fn show_mysql_table(conn: &mut AnyConnection, table: &QualifiedName) -> Re
     .context("failed to load MySQL indexes")?;
     let indexes = group_index_rows(indexes, "index_name", "column_name", "non_unique")?;
 
-    println!("Backend: mysql");
-    println!("Database: {database_name}");
-    println!("Table: {database_name}.{}", table.name);
-    println!("Estimated rows: {table_rows}");
-    println!("Table size: {}", humanize_bytes(size_bytes));
-    print_columns(&columns);
-    print_indexes(&indexes);
+    match output {
+        OutputMode::Json => {
+            let table_name = format!("{database_name}.{}", table.name);
+            print_json_event(vec![
+                json_str_field("event", "table_info"),
+                json_str_field("command", "table"),
+                json_str_field("backend", "mysql"),
+                json_str_field("database", &database_name),
+                json_str_field("table", &table_name),
+                json_i64_field("estimated_rows", table_rows),
+                json_i64_field("size_bytes", size_bytes),
+            ]);
+            for column in &columns {
+                let mut fields = vec![
+                    json_str_field("event", "column"),
+                    json_str_field("command", "table"),
+                    json_str_field("table", &table_name),
+                    json_str_field("name", &column.name),
+                    json_str_field("data_type", &column.data_type),
+                    json_bool_field("nullable", column.nullable),
+                ];
+                if let Some(default_value) = &column.default_value {
+                    fields.push(json_str_field("default", default_value));
+                } else {
+                    fields.push(json_null_field("default"));
+                }
+                print_json_event(fields);
+            }
+            for index in &indexes {
+                print_json_event(vec![
+                    json_str_field("event", "index"),
+                    json_str_field("command", "table"),
+                    json_str_field("table", &table_name),
+                    json_str_field("name", &index.name),
+                    json_bool_field("unique", index.unique),
+                    json_string_array_field("columns", &index.columns),
+                ]);
+            }
+            print_json_event(vec![
+                json_str_field("event", "summary"),
+                json_str_field("command", "table"),
+                json_usize_field("columns", columns.len()),
+                json_usize_field("indexes", indexes.len()),
+            ]);
+        }
+        _ => {
+            println!("Backend: mysql");
+            println!("Database: {database_name}");
+            println!("Table: {database_name}.{}", table.name);
+            println!("Estimated rows: {table_rows}");
+            println!("Table size: {}", humanize_bytes(size_bytes));
+            print_columns(&columns);
+            print_indexes(&indexes);
+        }
+    }
 
     Ok(())
 }
 
-async fn show_sqlite(conn: &mut AnyConnection, limit: usize) -> Result<()> {
+async fn show_sqlite(conn: &mut AnyConnection, limit: usize, output: OutputMode) -> Result<()> {
     let row = sqlx::query("PRAGMA page_count")
         .fetch_one(&mut *conn)
         .await
@@ -909,16 +1266,42 @@ async fn show_sqlite(conn: &mut AnyConnection, limit: usize) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    println!("Backend: sqlite");
-    println!("Database: {database_path}");
-    println!("Database size: {}", humanize_bytes(page_count * page_size));
-    println!("Open connections: n/a");
-    print_table_sizes("Tables", &tables);
+    match output {
+        OutputMode::Json => {
+            print_json_event(vec![
+                json_str_field("event", "database_info"),
+                json_str_field("command", "show"),
+                json_str_field("backend", "sqlite"),
+                json_str_field("database", &database_path),
+                json_i64_field("database_size_bytes", page_count * page_size),
+            ]);
+            for table in &tables {
+                print_json_event(vec![
+                    json_str_field("event", "table_size"),
+                    json_str_field("command", "show"),
+                    json_str_field("name", &table.name),
+                    json_null_field("size_bytes"),
+                ]);
+            }
+            print_json_event(vec![
+                json_str_field("event", "summary"),
+                json_str_field("command", "show"),
+                json_usize_field("count", tables.len()),
+            ]);
+        }
+        _ => {
+            println!("Backend: sqlite");
+            println!("Database: {database_path}");
+            println!("Database size: {}", humanize_bytes(page_count * page_size));
+            println!("Open connections: n/a");
+            print_table_sizes("Tables", &tables);
+        }
+    }
 
     Ok(())
 }
 
-async fn show_sqlite_table(conn: &mut AnyConnection, table: &QualifiedName) -> Result<()> {
+async fn show_sqlite_table(conn: &mut AnyConnection, table: &QualifiedName, output: OutputMode) -> Result<()> {
     if table.schema.is_some() {
         bail!("sqlite table inspection does not support schema-qualified names");
     }
@@ -973,12 +1356,58 @@ async fn show_sqlite_table(conn: &mut AnyConnection, table: &QualifiedName) -> R
         });
     }
 
-    println!("Backend: sqlite");
-    println!("Table: {}", table.name);
-    println!("Rows: {row_count}");
-    println!("Table size: n/a");
-    print_columns(&columns);
-    print_indexes(&indexes);
+    match output {
+        OutputMode::Json => {
+            print_json_event(vec![
+                json_str_field("event", "table_info"),
+                json_str_field("command", "table"),
+                json_str_field("backend", "sqlite"),
+                json_str_field("table", &table.name),
+                json_i64_field("rows", row_count),
+                json_null_field("size_bytes"),
+            ]);
+            for column in &columns {
+                let mut fields = vec![
+                    json_str_field("event", "column"),
+                    json_str_field("command", "table"),
+                    json_str_field("table", &table.name),
+                    json_str_field("name", &column.name),
+                    json_str_field("data_type", &column.data_type),
+                    json_bool_field("nullable", column.nullable),
+                ];
+                if let Some(default_value) = &column.default_value {
+                    fields.push(json_str_field("default", default_value));
+                } else {
+                    fields.push(json_null_field("default"));
+                }
+                print_json_event(fields);
+            }
+            for index in &indexes {
+                print_json_event(vec![
+                    json_str_field("event", "index"),
+                    json_str_field("command", "table"),
+                    json_str_field("table", &table.name),
+                    json_str_field("name", &index.name),
+                    json_bool_field("unique", index.unique),
+                    json_string_array_field("columns", &index.columns),
+                ]);
+            }
+            print_json_event(vec![
+                json_str_field("event", "summary"),
+                json_str_field("command", "table"),
+                json_usize_field("columns", columns.len()),
+                json_usize_field("indexes", indexes.len()),
+            ]);
+        }
+        _ => {
+            println!("Backend: sqlite");
+            println!("Table: {}", table.name);
+            println!("Rows: {row_count}");
+            println!("Table size: n/a");
+            print_columns(&columns);
+            print_indexes(&indexes);
+        }
+    }
 
     Ok(())
 }
@@ -1117,14 +1546,19 @@ fn group_index_rows(
     Ok(indexes)
 }
 
-async fn wipe(database_url: &str, yes: bool, quiet: bool) -> Result<()> {
+async fn wipe(database_url: &str, yes: bool, output: OutputMode) -> Result<()> {
     if !yes {
         bail!("wipe is destructive; re-run with `--yes` to confirm");
     }
 
     let total_started_at = Instant::now();
-    if !quiet {
-        println!("[1/1] Wiping database...");
+    match output {
+        OutputMode::Human => println!("[1/1] Wiping database..."),
+        OutputMode::Json => print_json_event(vec![
+            json_str_field("event", "start"),
+            json_str_field("command", "wipe"),
+        ]),
+        OutputMode::Quiet => {}
     }
     let started_at = Instant::now();
     let mut conn = connect(database_url).await?;
@@ -1135,22 +1569,38 @@ async fn wipe(database_url: &str, yes: bool, quiet: bool) -> Result<()> {
         DatabaseBackend::Sqlite => wipe_sqlite(&mut conn).await?,
     }
 
-    if !quiet {
-        println!("[1/1] Done wiping database in {:.2}s", started_at.elapsed().as_secs_f64());
+    match output {
+        OutputMode::Human => {
+            println!("[1/1] Done wiping database in {:.2}s", started_at.elapsed().as_secs_f64());
+            println!("Database wiped.");
+            println!("Total wipe time: {:.2}s", total_started_at.elapsed().as_secs_f64());
+        }
+        OutputMode::Json => print_json_event(vec![
+            json_str_field("event", "summary"),
+            json_str_field("command", "wipe"),
+            json_f64_field("duration_seconds", total_started_at.elapsed().as_secs_f64()),
+        ]),
+        OutputMode::Quiet => {
+            println!("Database wiped.");
+            println!("Total wipe time: {:.2}s", total_started_at.elapsed().as_secs_f64());
+        }
     }
-    println!("Database wiped.");
-    println!("Total wipe time: {:.2}s", total_started_at.elapsed().as_secs_f64());
     Ok(())
 }
 
-async fn fresh(dir: Option<PathBuf>, database_url: &str, yes: bool, quiet: bool) -> Result<()> {
+async fn fresh(dir: Option<PathBuf>, database_url: &str, yes: bool, output: OutputMode) -> Result<()> {
     if !yes {
         bail!("fresh is destructive; re-run with `--yes` to confirm");
     }
 
     let total_started_at = Instant::now();
-    if !quiet {
-        println!("[1/2] Wiping database...");
+    match output {
+        OutputMode::Human => println!("[1/2] Wiping database..."),
+        OutputMode::Json => print_json_event(vec![
+            json_str_field("event", "start"),
+            json_str_field("command", "fresh"),
+        ]),
+        OutputMode::Quiet => {}
     }
     let wipe_started_at = Instant::now();
     let mut conn = connect(database_url).await?;
@@ -1161,16 +1611,41 @@ async fn fresh(dir: Option<PathBuf>, database_url: &str, yes: bool, quiet: bool)
         DatabaseBackend::Sqlite => wipe_sqlite(&mut conn).await?,
     }
 
-    if !quiet {
-        println!("[1/2] Done wiping database in {:.2}s", wipe_started_at.elapsed().as_secs_f64());
-        println!("[2/2] Running migrations...");
+    match output {
+        OutputMode::Human => {
+            println!("[1/2] Done wiping database in {:.2}s", wipe_started_at.elapsed().as_secs_f64());
+            println!("[2/2] Running migrations...");
+        }
+        OutputMode::Json => print_json_event(vec![
+            json_str_field("event", "phase_finished"),
+            json_str_field("command", "fresh"),
+            json_str_field("phase", "wipe"),
+            json_f64_field("duration_seconds", wipe_started_at.elapsed().as_secs_f64()),
+        ]),
+        OutputMode::Quiet => {}
     }
     let migrate_started_at = Instant::now();
-    migrate(dir, database_url, quiet).await?;
-    if !quiet {
-        println!("[2/2] Done running migrations in {:.2}s", migrate_started_at.elapsed().as_secs_f64());
+    migrate(dir, database_url, output).await?;
+    match output {
+        OutputMode::Human => {
+            println!("[2/2] Done running migrations in {:.2}s", migrate_started_at.elapsed().as_secs_f64());
+            println!("Total fresh time: {:.2}s", total_started_at.elapsed().as_secs_f64());
+        }
+        OutputMode::Json => print_json_event(vec![
+            json_str_field("event", "phase_finished"),
+            json_str_field("command", "fresh"),
+            json_str_field("phase", "migrate"),
+            json_f64_field("duration_seconds", migrate_started_at.elapsed().as_secs_f64()),
+        ]),
+        OutputMode::Quiet => println!("Total fresh time: {:.2}s", total_started_at.elapsed().as_secs_f64()),
     }
-    println!("Total fresh time: {:.2}s", total_started_at.elapsed().as_secs_f64());
+    if matches!(output, OutputMode::Json) {
+        print_json_event(vec![
+            json_str_field("event", "summary"),
+            json_str_field("command", "fresh"),
+            json_f64_field("duration_seconds", total_started_at.elapsed().as_secs_f64()),
+        ]);
+    }
     Ok(())
 }
 
@@ -1482,30 +1957,53 @@ fn validate_identifier(value: &str) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_migration_table(conn: &mut AnyConnection, migration_table: &str) -> Result<()> {
-    let exists = sqlx::query(
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1"
-    )
-    .bind(migration_table)
-    .fetch_optional(&mut *conn)
-    .await
-    .context("failed to check migration tracking table")?
-    .is_some();
-
-    if !exists {
-        let sql = format!(
-            "CREATE TABLE {migration_table} (
-                version VARCHAR(255) PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                checksum VARCHAR(64) NOT NULL,
-                applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )"
-        );
-
-        sqlx::raw_sql(&sql)
-            .execute(conn)
+async fn ensure_migration_table(
+    conn: &mut AnyConnection,
+    migration_table: &str,
+    backend: DatabaseBackend,
+) -> Result<()> {
+    match backend {
+        DatabaseBackend::Postgres => {
+            let exists = sqlx::query(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1"
+            )
+            .bind(migration_table)
+            .fetch_optional(&mut *conn)
             .await
-            .context("failed to create migration tracking table")?;
+            .context("failed to check migration tracking table")?
+            .is_some();
+
+            if !exists {
+                let sql = format!(
+                    "CREATE TABLE {migration_table} (
+                        version VARCHAR(255) PRIMARY KEY,
+                        name VARCHAR(255) NOT NULL,
+                        checksum VARCHAR(64) NOT NULL,
+                        applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )"
+                );
+
+                sqlx::raw_sql(&sql)
+                    .execute(conn)
+                    .await
+                    .context("failed to create migration tracking table")?;
+            }
+        }
+        DatabaseBackend::MySql | DatabaseBackend::Sqlite => {
+            let sql = format!(
+                "CREATE TABLE IF NOT EXISTS {migration_table} (
+                    version VARCHAR(255) PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    checksum VARCHAR(64) NOT NULL,
+                    applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )"
+            );
+
+            sqlx::raw_sql(&sql)
+                .execute(conn)
+                .await
+                .context("failed to create migration tracking table")?;
+        }
     }
 
     Ok(())
