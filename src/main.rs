@@ -304,6 +304,18 @@ async fn migrate(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
     ensure_migration_table(&mut conn, &migration_table).await?;
     let applied = load_applied_migrations(&mut conn, &migration_table).await?;
 
+    let pending = migrations
+        .iter()
+        .filter(|migration| !applied.contains_key(&migration.version))
+        .count();
+
+    if pending == 0 {
+        println!("No pending migrations.");
+        return Ok(());
+    }
+
+    println!("Running {pending} pending migration(s)...");
+
     let mut applied_now = 0usize;
 
     for migration in migrations {
@@ -317,15 +329,16 @@ async fn migrate(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
             continue;
         }
 
+        println!(
+            "Running {} ({})...",
+            migration.version, migration.name
+        );
         apply_migration(&mut conn, &migration_table, &migration).await?;
         applied_now += 1;
+        println!("Done {} ({})", migration.version, migration.name);
     }
 
-    if applied_now > 0 {
-        println!("Applied {applied_now} migration(s).");
-    } else {
-        println!("No pending migrations.");
-    }
+    println!("Applied {applied_now} migration(s).");
 
     Ok(())
 }
