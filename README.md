@@ -95,7 +95,7 @@ dbrs fresh --yes
 By default, `dbrs new my_migration` creates:
 
 ```text
-./db/migrations/YYYY_MM_DD_HH_MM_SS.microseconds-my-migration.sql
+./db/migrations/YYYY_MM_DD_HHMMSS-my-migration.sql
 ```
 
 Default file template:

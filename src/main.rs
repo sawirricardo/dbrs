@@ -930,7 +930,7 @@ fn load_migration(path: &Path) -> Result<Migration> {
 
     let (version, name) = stem.split_once('-').ok_or_else(|| {
         anyhow!(
-            "migration filename must look like yyyy_mm_dd_hh_mm_ss.microseconds-name.sql: {}",
+            "migration filename must look like yyyy_mm_dd_hhmmss-name.sql: {}",
             path.display()
         )
     })?;
@@ -985,28 +985,31 @@ fn resolve_migrations_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
 
 fn sanitize_migration_name(name: &str) -> String {
     let mut sanitized = String::with_capacity(name.len());
-    let mut last_was_dash = false;
+    let mut last_separator: Option<char> = None;
 
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() {
             sanitized.push(ch.to_ascii_lowercase());
-            last_was_dash = false;
-        } else if !last_was_dash {
-            sanitized.push('-');
-            last_was_dash = true;
+            last_separator = None;
+        } else if matches!(ch, '_' | '-') {
+            if last_separator != Some(ch) {
+                sanitized.push(ch);
+                last_separator = Some(ch);
+            }
+        } else if last_separator != Some('_') {
+            sanitized.push('_');
+            last_separator = Some('_');
         }
     }
 
-    sanitized.trim_matches('-').to_string()
+    sanitized
+        .trim_matches(|ch| matches!(ch, '_' | '-'))
+        .to_string()
 }
 
 fn timestamp_prefix() -> String {
     let now = Local::now();
-    format!(
-        "{}.{:06}",
-        now.format("%Y_%m_%d_%H_%M_%S"),
-        now.timestamp_subsec_micros()
-    )
+    now.format("%Y_%m_%d_%H%M%S").to_string()
 }
 
 fn checksum(content: &str) -> String {
@@ -1027,11 +1030,15 @@ mod tests {
     fn sanitizes_migration_names() {
         assert_eq!(
             sanitize_migration_name("Create Users Table"),
-            "create-users-table"
+            "create_users_table"
         );
         assert_eq!(
             sanitize_migration_name("add__email!!index"),
-            "add-email-index"
+            "add_email_index"
+        );
+        assert_eq!(
+            sanitize_migration_name("create-users-table"),
+            "create-users-table"
         );
         assert_eq!(sanitize_migration_name("___"), "");
     }
@@ -1236,5 +1243,14 @@ mod tests {
             .expect_err("selection should fail");
 
         assert!(err.to_string().contains("not currently applied"));
+    }
+
+    #[test]
+    fn timestamp_prefix_uses_expected_format() {
+        let prefix = super::timestamp_prefix();
+
+        assert!(!prefix.contains('.'));
+        assert_eq!(prefix.matches('_').count(), 3);
+        assert_eq!(prefix.len(), 17);
     }
 }
