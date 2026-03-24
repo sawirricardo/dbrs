@@ -2,7 +2,7 @@
 
 `dbrs` is a small SQL migration tool.
 
-It creates timestamped migration files, applies pending migrations, tracks applied versions in a database table, supports one-step rollback, and includes destructive reset commands for development workflows.
+It creates timestamped migration files, applies pending migrations, tracks applied versions in a database table, supports rolling migrations back in reverse order, and includes destructive reset commands for development workflows.
 
 ## Features
 
@@ -10,7 +10,8 @@ It creates timestamped migration files, applies pending migrations, tracks appli
 - Default migration path at `./db/migrations`
 - `migrate` to apply pending migrations
 - `status` to show applied and pending migrations
-- `rollback` to revert the latest applied migration
+- `rollback` to revert one or more applied migrations
+- `reset` to revert all tracked migrations
 - `wipe` to reset the current database without dropping the database itself
 - `fresh` to wipe and then re-run all migrations
 - `.env` support, including custom env file paths
@@ -77,6 +78,12 @@ Roll back the latest migration:
 dbrs rollback --yes
 ```
 
+Reset all tracked migrations:
+
+```bash
+dbrs reset --yes
+```
+
 Reset the database and re-run all migrations:
 
 ```bash
@@ -107,7 +114,7 @@ Rules:
 
 - `-- dbrs:up` is required
 - `-- dbrs:down` is optional
-- `rollback` fails if the latest applied migration has no `down` section
+- `rollback` and `reset` fail if they hit a migration with no `down` section
 - migrations are applied in filename order
 
 Example:
@@ -165,10 +172,16 @@ Output states:
 - `APPLIED_MODIFIED`
 - `MISSING_FILE`
 
-Roll back one migration:
+Roll back one or more migrations:
 
 ```bash
-dbrs rollback --database-url <DATABASE_URL> --yes
+dbrs rollback --database-url <DATABASE_URL> --steps 3 --yes
+```
+
+Reset all tracked migrations:
+
+```bash
+dbrs reset --database-url <DATABASE_URL> --yes
 ```
 
 Wipe the current database contents:
@@ -251,6 +264,7 @@ Backend behavior:
 These commands require explicit confirmation with `--yes`:
 
 - `rollback`
+- `reset`
 - `wipe`
 - `fresh`
 

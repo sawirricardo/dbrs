@@ -77,6 +77,17 @@ enum Commands {
         dir: Option<PathBuf>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
+        #[arg(long, default_value_t = 1)]
+        steps: usize,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Revert all applied migrations in reverse order
+    Reset {
+        #[arg(long, env = MIGRATIONS_DIR_ENV)]
+        dir: Option<PathBuf>,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
         #[arg(long)]
         yes: bool,
     },
@@ -98,6 +109,12 @@ struct Migration {
     checksum: String,
     up_sql: String,
     down_sql: String,
+}
+
+#[derive(Debug, Clone)]
+struct AppliedMigration {
+    version: String,
+    checksum: String,
 }
 
 #[tokio::main]
@@ -126,8 +143,14 @@ async fn main() -> Result<()> {
         Commands::Rollback {
             dir,
             database_url,
+            steps,
             yes,
-        } => rollback(dir, &database_url, yes).await?,
+        } => rollback(dir, &database_url, steps, yes).await?,
+        Commands::Reset {
+            dir,
+            database_url,
+            yes,
+        } => reset(dir, &database_url, yes).await?,
     }
 
     Ok(())
@@ -259,10 +282,32 @@ async fn migrate(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn rollback(dir: Option<PathBuf>, database_url: &str, yes: bool) -> Result<()> {
+async fn rollback(dir: Option<PathBuf>, database_url: &str, steps: usize, yes: bool) -> Result<()> {
     if !yes {
         bail!("rollback is destructive; re-run with `--yes` to confirm");
     }
+    if steps == 0 {
+        bail!("rollback steps must be at least 1");
+    }
+
+    run_rollbacks(dir, database_url, Some(steps), "roll back").await
+}
+
+async fn reset(dir: Option<PathBuf>, database_url: &str, yes: bool) -> Result<()> {
+    if !yes {
+        bail!("reset is destructive; re-run with `--yes` to confirm");
+    }
+
+    run_rollbacks(dir, database_url, None, "reset").await
+}
+
+async fn run_rollbacks(
+    dir: Option<PathBuf>,
+    database_url: &str,
+    steps: Option<usize>,
+    verb: &str,
+) -> Result<()> {
+    let target_count = steps.unwrap_or(usize::MAX);
 
     let migrations = load_migrations(dir)?;
     let migrations_by_version: HashMap<String, Migration> = migrations
@@ -274,34 +319,42 @@ async fn rollback(dir: Option<PathBuf>, database_url: &str, yes: bool) -> Result
     let migration_table = resolve_migration_table_name()?;
     ensure_migration_table(&mut conn, &migration_table).await?;
 
-    let row = sqlx::query(&format!(
-        "SELECT version, checksum FROM {migration_table} ORDER BY version DESC LIMIT 1"
-    ))
-    .fetch_optional(&mut conn)
-    .await
-    .context("failed to read applied migrations")?;
+    let applied = load_applied_migration_history(&mut conn, &migration_table).await?;
 
-    let Some(row) = row else {
-        println!("No applied migrations to roll back.");
+    if applied.is_empty() {
+        if steps.is_some() {
+            println!("No applied migrations to roll back.");
+        } else {
+            println!("No applied migrations to reset.");
+        }
         return Ok(());
-    };
-
-    let version: String = row.try_get("version")?;
-    let checksum: String = row.try_get("checksum")?;
-
-    let migration = migrations_by_version
-        .get(&version)
-        .ok_or_else(|| anyhow!("missing migration file for applied version {version}"))?;
-
-    if migration.checksum != checksum {
-        bail!(
-            "migration {} does not match the applied checksum",
-            migration.path.display()
-        );
     }
 
-    rollback_migration(&mut conn, &migration_table, migration).await?;
-    println!("Rolled back {} ({})", migration.version, migration.name);
+    let mut rolled_back = 0usize;
+
+    for applied_migration in applied.into_iter().take(target_count) {
+        let migration = migrations_by_version
+            .get(&applied_migration.version)
+            .ok_or_else(|| {
+                anyhow!(
+                    "missing migration file for applied version {}",
+                    applied_migration.version
+                )
+            })?;
+
+        if migration.checksum != applied_migration.checksum {
+            bail!(
+                "migration {} does not match the applied checksum",
+                migration.path.display()
+            );
+        }
+
+        rollback_migration(&mut conn, &migration_table, migration).await?;
+        println!("Rolled back {} ({})", migration.version, migration.name);
+        rolled_back += 1;
+    }
+
+    println!("Completed {verb}: reverted {rolled_back} migration(s).");
 
     Ok(())
 }
@@ -701,6 +754,28 @@ async fn load_applied_migrations(
         let version: String = row.try_get("version")?;
         let checksum: String = row.try_get("checksum")?;
         applied.insert(version, checksum);
+    }
+
+    Ok(applied)
+}
+
+async fn load_applied_migration_history(
+    conn: &mut AnyConnection,
+    migration_table: &str,
+) -> Result<Vec<AppliedMigration>> {
+    let rows = sqlx::query(&format!(
+        "SELECT version, checksum FROM {migration_table} ORDER BY version DESC"
+    ))
+    .fetch_all(conn)
+    .await
+    .context("failed to read applied migrations")?;
+
+    let mut applied = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let version: String = row.try_get("version")?;
+        let checksum: String = row.try_get("checksum")?;
+        applied.push(AppliedMigration { version, checksum });
     }
 
     Ok(applied)
