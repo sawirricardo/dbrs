@@ -10,7 +10,7 @@ use chrono::Local;
 use clap::{Parser, Subcommand, ValueEnum};
 use dotenvy::{dotenv, from_path};
 use sha2::{Digest, Sha256};
-use sqlx::{Any, AnyConnection, Connection, QueryBuilder, Row, any::install_default_drivers};
+use sqlx::{AnyConnection, Connection, Row, any::install_default_drivers};
 
 const DEFAULT_MIGRATION_TABLE: &str = "dbrs_migrations";
 const UP_MARKER: &str = "-- dbrs:up";
@@ -534,7 +534,7 @@ async fn show_postgres(conn: &mut AnyConnection, limit: usize) -> Result<()> {
         .unwrap_or(0);
 
     let schemas = sqlx::query(
-        "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog', 'information_schema') ORDER BY schema_name"
+        "SELECT schema_name::text AS schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog', 'information_schema') ORDER BY schema_name"
     )
     .fetch_all(&mut *conn)
     .await
@@ -545,7 +545,7 @@ async fn show_postgres(conn: &mut AnyConnection, limit: usize) -> Result<()> {
         .collect::<Vec<_>>();
 
     let tables = sqlx::query(&format!(
-        "SELECT schemaname, relname, pg_total_relation_size(relid) AS total_bytes \
+        "SELECT schemaname::text AS schemaname, relname::text AS relname, pg_total_relation_size(relid) AS total_bytes \
          FROM pg_catalog.pg_statio_user_tables \
          ORDER BY total_bytes DESC, schemaname, relname \
          LIMIT {limit}"
@@ -611,7 +611,7 @@ async fn show_postgres_table(conn: &mut AnyConnection, table: &QualifiedName) ->
     let size_bytes: i64 = row.try_get("size_bytes")?;
 
     let columns = sqlx::query(
-        "SELECT column_name, data_type, is_nullable, column_default \
+        "SELECT column_name::text AS column_name, data_type, is_nullable, column_default \
          FROM information_schema.columns \
          WHERE table_schema = $1 AND table_name = $2 \
          ORDER BY ordinal_position",
@@ -635,7 +635,7 @@ async fn show_postgres_table(conn: &mut AnyConnection, table: &QualifiedName) ->
         .collect::<Result<Vec<_>>>()?;
 
     let indexes = sqlx::query(
-        "SELECT indexname, indexdef \
+        "SELECT indexname::text AS indexname, indexdef \
          FROM pg_indexes \
          WHERE schemaname = $1 AND tablename = $2 \
          ORDER BY indexname",
@@ -1386,19 +1386,30 @@ fn validate_identifier(value: &str) -> Result<()> {
 }
 
 async fn ensure_migration_table(conn: &mut AnyConnection, migration_table: &str) -> Result<()> {
-    let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {migration_table} (
-            version VARCHAR(255) PRIMARY KEY,
-            name VARCHAR(255) NOT NULL,
-            checksum VARCHAR(64) NOT NULL,
-            applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )"
-    );
+    let exists = sqlx::query(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1"
+    )
+    .bind(migration_table)
+    .fetch_optional(&mut *conn)
+    .await
+    .context("failed to check migration tracking table")?
+    .is_some();
 
-    sqlx::raw_sql(&sql)
-        .execute(conn)
-        .await
-        .context("failed to create migration tracking table")?;
+    if !exists {
+        let sql = format!(
+            "CREATE TABLE {migration_table} (
+                version VARCHAR(255) PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                checksum VARCHAR(64) NOT NULL,
+                applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )"
+        );
+
+        sqlx::raw_sql(&sql)
+            .execute(conn)
+            .await
+            .context("failed to create migration tracking table")?;
+    }
 
     Ok(())
 }
@@ -1464,19 +1475,9 @@ async fn apply_migration(
         .await
         .with_context(|| format!("failed to apply migration {}", migration.path.display()))?;
 
-    let mut query = QueryBuilder::<Any>::new(format!(
-        "INSERT INTO {migration_table} (version, name, checksum) "
-    ));
-    query.push("VALUES (");
-    query.push_bind(&migration.version);
-    query.push(", ");
-    query.push_bind(&migration.name);
-    query.push(", ");
-    query.push_bind(&migration.checksum);
-    query.push(")");
+    let sql = migration_record_insert_sql(migration_table, migration);
 
-    query
-        .build()
+    sqlx::raw_sql(&sql)
         .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to record migration {}", migration.path.display()))?;
@@ -1504,11 +1505,9 @@ async fn rollback_migration(
         .await
         .with_context(|| format!("failed to roll back migration {}", migration.path.display()))?;
 
-    let mut query =
-        QueryBuilder::<Any>::new(format!("DELETE FROM {migration_table} WHERE version = "));
-    query.push_bind(&migration.version);
+    let sql = migration_record_delete_sql(migration_table, &migration.version);
 
-    query.build().execute(&mut *tx).await.with_context(|| {
+    sqlx::raw_sql(&sql).execute(&mut *tx).await.with_context(|| {
         format!(
             "failed to remove migration record {}",
             migration.path.display()
@@ -1517,6 +1516,26 @@ async fn rollback_migration(
 
     tx.commit().await.context("failed to commit rollback")?;
     Ok(())
+}
+
+fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn migration_record_insert_sql(migration_table: &str, migration: &Migration) -> String {
+    format!(
+        "INSERT INTO {migration_table} (version, name, checksum) VALUES ('{}', '{}', '{}')",
+        escape_sql_literal(&migration.version),
+        escape_sql_literal(&migration.name),
+        escape_sql_literal(&migration.checksum)
+    )
+}
+
+fn migration_record_delete_sql(migration_table: &str, version: &str) -> String {
+    format!(
+        "DELETE FROM {migration_table} WHERE version = '{}'",
+        escape_sql_literal(version)
+    )
 }
 
 fn load_migrations(dir: Option<PathBuf>) -> Result<Vec<Migration>> {
