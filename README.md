@@ -10,6 +10,7 @@ It creates timestamped migration files, applies pending migrations, tracks appli
 - Default migration path at `./db/migrations`
 - `migrate` to apply pending migrations
 - `status` to show applied and pending migrations
+- `show` to inspect database metadata and table sizes
 - `rollback` to revert one or more applied migrations
 - `reset` to revert all tracked migrations
 - `wipe` to reset the current database without dropping the database itself
@@ -70,6 +71,12 @@ Check migration status:
 
 ```bash
 dbrs status
+```
+
+Inspect the database:
+
+```bash
+dbrs show
 ```
 
 Roll back the latest migration:
@@ -171,6 +178,17 @@ Output states:
 - `PENDING`
 - `APPLIED_MODIFIED`
 - `MISSING_FILE`
+
+Show database info:
+
+```bash
+dbrs show --database-url <DATABASE_URL>
+```
+
+Options:
+
+- `--database-url <DATABASE_URL>` or `DATABASE_URL`
+- `--limit <N>` for the number of tables to print, default `20`
 
 Roll back one or more migrations:
 

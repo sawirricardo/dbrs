@@ -55,6 +55,13 @@ enum Commands {
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
+    /// Show database information and table sizes
+    Show {
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Wipe the current database contents and then apply all migrations
     Fresh {
         #[arg(long, env = MIGRATIONS_DIR_ENV)]
@@ -136,6 +143,10 @@ async fn main() -> Result<()> {
         } => create_new_migration(dir, &name, table, backend)?,
         Commands::Migrate { dir, database_url } => migrate(dir, &database_url).await?,
         Commands::Status { dir, database_url } => status(dir, &database_url).await?,
+        Commands::Show {
+            database_url,
+            limit,
+        } => show(&database_url, limit).await?,
         Commands::Fresh {
             dir,
             database_url,
@@ -157,6 +168,12 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct TableSize {
+    name: String,
+    size_bytes: Option<i64>,
 }
 
 fn load_dotenv_file() -> Result<()> {
@@ -435,6 +452,234 @@ async fn status(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn show(database_url: &str, limit: usize) -> Result<()> {
+    if limit == 0 {
+        bail!("show limit must be at least 1");
+    }
+
+    let mut conn = connect(database_url).await?;
+
+    match detect_backend(database_url)? {
+        DatabaseBackend::Postgres => show_postgres(&mut conn, limit).await?,
+        DatabaseBackend::MySql => show_mysql(&mut conn, limit).await?,
+        DatabaseBackend::Sqlite => show_sqlite(&mut conn, limit).await?,
+    }
+
+    Ok(())
+}
+
+async fn show_postgres(conn: &mut AnyConnection, limit: usize) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT current_database() AS database_name, current_schema() AS schema_name, pg_database_size(current_database()) AS database_size_bytes"
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("failed to load PostgreSQL database info")?;
+
+    let database_name: String = row.try_get("database_name")?;
+    let schema_name: String = row.try_get("schema_name")?;
+    let database_size_bytes: i64 = row.try_get("database_size_bytes")?;
+
+    let row = sqlx::query(
+        "SELECT numbackends AS open_connections FROM pg_stat_database WHERE datname = current_database()"
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .context("failed to load PostgreSQL connection info")?;
+    let open_connections = row
+        .and_then(|row| row.try_get::<i32, _>("open_connections").ok())
+        .unwrap_or(0);
+
+    let schemas = sqlx::query(
+        "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog', 'information_schema') ORDER BY schema_name"
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to load PostgreSQL schemas")?;
+    let schemas = schemas
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>("schema_name").ok())
+        .collect::<Vec<_>>();
+
+    let tables = sqlx::query(&format!(
+        "SELECT schemaname, relname, pg_total_relation_size(relid) AS total_bytes \
+         FROM pg_catalog.pg_statio_user_tables \
+         ORDER BY total_bytes DESC, schemaname, relname \
+         LIMIT {limit}"
+    ))
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to load PostgreSQL table sizes")?;
+
+    let tables = tables
+        .into_iter()
+        .map(|row| -> Result<TableSize> {
+            let schema: String = row.try_get("schemaname")?;
+            let table: String = row.try_get("relname")?;
+            let size_bytes: i64 = row.try_get("total_bytes")?;
+            Ok(TableSize {
+                name: format!("{schema}.{table}"),
+                size_bytes: Some(size_bytes),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    println!("Backend: postgres");
+    println!("Database: {database_name}");
+    println!("Current schema: {schema_name}");
+    println!("Database size: {}", humanize_bytes(database_size_bytes));
+    println!("Open connections: {open_connections}");
+    println!(
+        "Schemas: {}",
+        if schemas.is_empty() {
+            "<none>".to_string()
+        } else {
+            schemas.join(", ")
+        }
+    );
+    print_table_sizes("Largest tables", &tables);
+
+    Ok(())
+}
+
+async fn show_mysql(conn: &mut AnyConnection, limit: usize) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT DATABASE() AS database_name, \
+         COALESCE(SUM(data_length + index_length), 0) AS database_size_bytes \
+         FROM information_schema.tables \
+         WHERE table_schema = DATABASE()",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("failed to load MySQL database info")?;
+
+    let database_name: Option<String> = row.try_get("database_name")?;
+    let database_name = database_name
+        .ok_or_else(|| anyhow!("no MySQL database is selected for this connection"))?;
+    let database_size_bytes: i64 = row.try_get("database_size_bytes")?;
+
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS open_connections FROM information_schema.processlist WHERE db = DATABASE()"
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("failed to load MySQL connection info")?;
+    let open_connections: i64 = row.try_get("open_connections")?;
+
+    let tables = sqlx::query(&format!(
+        "SELECT table_name, COALESCE(data_length + index_length, 0) AS total_bytes \
+         FROM information_schema.tables \
+         WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' \
+         ORDER BY total_bytes DESC, table_name \
+         LIMIT {limit}"
+    ))
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to load MySQL table sizes")?;
+
+    let tables = tables
+        .into_iter()
+        .map(|row| -> Result<TableSize> {
+            Ok(TableSize {
+                name: row.try_get("table_name")?,
+                size_bytes: Some(row.try_get("total_bytes")?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    println!("Backend: mysql");
+    println!("Database: {database_name}");
+    println!("Database size: {}", humanize_bytes(database_size_bytes));
+    println!("Open connections: {open_connections}");
+    print_table_sizes("Largest tables", &tables);
+
+    Ok(())
+}
+
+async fn show_sqlite(conn: &mut AnyConnection, limit: usize) -> Result<()> {
+    let row = sqlx::query("PRAGMA page_count")
+        .fetch_one(&mut *conn)
+        .await
+        .context("failed to load SQLite page count")?;
+    let page_count: i64 = row.try_get(0)?;
+
+    let row = sqlx::query("PRAGMA page_size")
+        .fetch_one(&mut *conn)
+        .await
+        .context("failed to load SQLite page size")?;
+    let page_size: i64 = row.try_get(0)?;
+
+    let db_list = sqlx::query("PRAGMA database_list")
+        .fetch_all(&mut *conn)
+        .await
+        .context("failed to load SQLite database list")?;
+    let database_path = db_list
+        .into_iter()
+        .find_map(|row| row.try_get::<String, _>("file").ok())
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| ":memory:".to_string());
+
+    let tables = sqlx::query(&format!(
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+         ORDER BY name \
+         LIMIT {limit}"
+    ))
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to load SQLite tables")?;
+
+    let tables = tables
+        .into_iter()
+        .map(|row| -> Result<TableSize> {
+            Ok(TableSize {
+                name: row.try_get("name")?,
+                size_bytes: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    println!("Backend: sqlite");
+    println!("Database: {database_path}");
+    println!("Database size: {}", humanize_bytes(page_count * page_size));
+    println!("Open connections: n/a");
+    print_table_sizes("Tables", &tables);
+
+    Ok(())
+}
+
+fn print_table_sizes(title: &str, tables: &[TableSize]) {
+    println!("{title}:");
+    if tables.is_empty() {
+        println!("  <none>");
+        return;
+    }
+
+    for table in tables {
+        match table.size_bytes {
+            Some(size_bytes) => println!("  {} ({})", table.name, humanize_bytes(size_bytes)),
+            None => println!("  {}", table.name),
+        }
+    }
+}
+
+fn humanize_bytes(bytes: i64) -> String {
+    let mut value = bytes.max(0) as f64;
+    let units = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut unit = 0usize;
+
+    while value >= 1024.0 && unit < units.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{} {}", value as u64, units[unit])
+    } else {
+        format!("{value:.1} {}", units[unit])
+    }
 }
 
 async fn wipe(database_url: &str, yes: bool) -> Result<()> {
@@ -1021,7 +1266,7 @@ fn checksum(content: &str) -> String {
 mod tests {
     use super::{
         AppliedMigration, DEFAULT_MIGRATION_TABLE, DOWN_MARKER, DatabaseBackend, RollbackTarget,
-        UP_MARKER, detect_backend, infer_table_name, parse_migration_sections,
+        UP_MARKER, detect_backend, humanize_bytes, infer_table_name, parse_migration_sections,
         parse_migration_table_name, quote_identifier, resolve_env_file_override,
         sanitize_migration_name, scaffold_table_migration, select_rollbacks, validate_identifier,
     };
@@ -1252,5 +1497,12 @@ mod tests {
         assert!(!prefix.contains('.'));
         assert_eq!(prefix.matches('_').count(), 3);
         assert_eq!(prefix.len(), 17);
+    }
+
+    #[test]
+    fn humanizes_bytes() {
+        assert_eq!(humanize_bytes(999), "999 B");
+        assert_eq!(humanize_bytes(1024), "1.0 KB");
+        assert_eq!(humanize_bytes(5 * 1024 * 1024), "5.0 MB");
     }
 }
