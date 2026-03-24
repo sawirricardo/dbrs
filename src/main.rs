@@ -513,7 +513,7 @@ async fn table(name: &str, database_url: &str) -> Result<()> {
 
 async fn show_postgres(conn: &mut AnyConnection, limit: usize) -> Result<()> {
     let row = sqlx::query(
-        "SELECT current_database() AS database_name, current_schema() AS schema_name, pg_database_size(current_database()) AS database_size_bytes"
+        "SELECT current_database()::text AS database_name, current_schema()::text AS schema_name, pg_database_size(current_database()) AS database_size_bytes"
     )
     .fetch_one(&mut *conn)
     .await
@@ -587,7 +587,7 @@ async fn show_postgres(conn: &mut AnyConnection, limit: usize) -> Result<()> {
 
 async fn show_postgres_table(conn: &mut AnyConnection, table: &QualifiedName) -> Result<()> {
     let row =
-        sqlx::query("SELECT current_database() AS database_name, current_schema() AS schema_name")
+        sqlx::query("SELECT current_database()::text AS database_name, current_schema()::text AS schema_name")
             .fetch_one(&mut *conn)
             .await
             .context("failed to load PostgreSQL database info")?;
@@ -1113,7 +1113,7 @@ fn detect_backend(database_url: &str) -> Result<DatabaseBackend> {
 }
 
 async fn wipe_postgres(conn: &mut AnyConnection) -> Result<()> {
-    let row = sqlx::query("SELECT current_schema() AS schema_name")
+    let row = sqlx::query("SELECT current_schema()::text AS schema_name")
         .fetch_one(&mut *conn)
         .await
         .context("failed to determine current PostgreSQL schema")?;
