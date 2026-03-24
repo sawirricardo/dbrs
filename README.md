@@ -11,6 +11,7 @@ It creates timestamped migration files, applies pending migrations, tracks appli
 - `migrate` to apply pending migrations
 - `status` to show applied and pending migrations
 - `show` to inspect database metadata and table sizes
+- `table` to inspect one table's columns and indexes
 - `rollback` to revert one or more applied migrations
 - `reset` to revert all tracked migrations
 - `wipe` to reset the current database without dropping the database itself
@@ -77,6 +78,12 @@ Inspect the database:
 
 ```bash
 dbrs show
+```
+
+Inspect a table:
+
+```bash
+dbrs table users
 ```
 
 Roll back the latest migration:
@@ -189,6 +196,17 @@ Options:
 
 - `--database-url <DATABASE_URL>` or `DATABASE_URL`
 - `--limit <N>` for the number of tables to print, default `20`
+
+Inspect one table:
+
+```bash
+dbrs table users --database-url <DATABASE_URL>
+```
+
+The table name can be either:
+
+- `table`
+- `schema.table`
 
 Roll back one or more migrations:
 

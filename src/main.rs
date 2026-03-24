@@ -62,6 +62,12 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Inspect a single table
+    Table {
+        name: String,
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+    },
     /// Wipe the current database contents and then apply all migrations
     Fresh {
         #[arg(long, env = MIGRATIONS_DIR_ENV)]
@@ -147,6 +153,7 @@ async fn main() -> Result<()> {
             database_url,
             limit,
         } => show(&database_url, limit).await?,
+        Commands::Table { name, database_url } => table(&name, &database_url).await?,
         Commands::Fresh {
             dir,
             database_url,
@@ -174,6 +181,27 @@ async fn main() -> Result<()> {
 struct TableSize {
     name: String,
     size_bytes: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct QualifiedName {
+    schema: Option<String>,
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+struct ColumnInfo {
+    name: String,
+    data_type: String,
+    nullable: bool,
+    default_value: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IndexInfo {
+    name: String,
+    columns: Vec<String>,
+    unique: bool,
 }
 
 fn load_dotenv_file() -> Result<()> {
@@ -470,6 +498,19 @@ async fn show(database_url: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
+async fn table(name: &str, database_url: &str) -> Result<()> {
+    let table = parse_qualified_name(name)?;
+    let mut conn = connect(database_url).await?;
+
+    match detect_backend(database_url)? {
+        DatabaseBackend::Postgres => show_postgres_table(&mut conn, &table).await?,
+        DatabaseBackend::MySql => show_mysql_table(&mut conn, &table).await?,
+        DatabaseBackend::Sqlite => show_sqlite_table(&mut conn, &table).await?,
+    }
+
+    Ok(())
+}
+
 async fn show_postgres(conn: &mut AnyConnection, limit: usize) -> Result<()> {
     let row = sqlx::query(
         "SELECT current_database() AS database_name, current_schema() AS schema_name, pg_database_size(current_database()) AS database_size_bytes"
@@ -544,6 +585,91 @@ async fn show_postgres(conn: &mut AnyConnection, limit: usize) -> Result<()> {
     Ok(())
 }
 
+async fn show_postgres_table(conn: &mut AnyConnection, table: &QualifiedName) -> Result<()> {
+    let row =
+        sqlx::query("SELECT current_database() AS database_name, current_schema() AS schema_name")
+            .fetch_one(&mut *conn)
+            .await
+            .context("failed to load PostgreSQL database info")?;
+    let database_name: String = row.try_get("database_name")?;
+    let current_schema: String = row.try_get("schema_name")?;
+    let schema = table.schema.clone().unwrap_or(current_schema);
+
+    let row = sqlx::query(
+        "SELECT c.reltuples::bigint AS estimated_rows, pg_total_relation_size(c.oid) AS size_bytes \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r'",
+    )
+    .bind(&schema)
+    .bind(&table.name)
+    .fetch_optional(&mut *conn)
+    .await
+    .context("failed to load PostgreSQL table stats")?
+    .ok_or_else(|| anyhow!("table `{schema}.{}` was not found", table.name))?;
+    let estimated_rows: i64 = row.try_get("estimated_rows")?;
+    let size_bytes: i64 = row.try_get("size_bytes")?;
+
+    let columns = sqlx::query(
+        "SELECT column_name, data_type, is_nullable, column_default \
+         FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = $2 \
+         ORDER BY ordinal_position",
+    )
+    .bind(&schema)
+    .bind(&table.name)
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to load PostgreSQL columns")?;
+
+    let columns = columns
+        .into_iter()
+        .map(|row| -> Result<ColumnInfo> {
+            Ok(ColumnInfo {
+                name: row.try_get("column_name")?,
+                data_type: row.try_get("data_type")?,
+                nullable: row.try_get::<String, _>("is_nullable")? == "YES",
+                default_value: row.try_get("column_default")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let indexes = sqlx::query(
+        "SELECT indexname, indexdef \
+         FROM pg_indexes \
+         WHERE schemaname = $1 AND tablename = $2 \
+         ORDER BY indexname",
+    )
+    .bind(&schema)
+    .bind(&table.name)
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to load PostgreSQL indexes")?;
+
+    let indexes = indexes
+        .into_iter()
+        .map(|row| -> Result<IndexInfo> {
+            let name: String = row.try_get("indexname")?;
+            let definition: String = row.try_get("indexdef")?;
+            Ok(IndexInfo {
+                unique: definition.contains("UNIQUE INDEX"),
+                columns: extract_index_columns(&definition),
+                name,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    println!("Backend: postgres");
+    println!("Database: {database_name}");
+    println!("Table: {schema}.{}", table.name);
+    println!("Estimated rows: {estimated_rows}");
+    println!("Table size: {}", humanize_bytes(size_bytes));
+    print_columns(&columns);
+    print_indexes(&indexes);
+
+    Ok(())
+}
+
 async fn show_mysql(conn: &mut AnyConnection, limit: usize) -> Result<()> {
     let row = sqlx::query(
         "SELECT DATABASE() AS database_name, \
@@ -594,6 +720,82 @@ async fn show_mysql(conn: &mut AnyConnection, limit: usize) -> Result<()> {
     println!("Database size: {}", humanize_bytes(database_size_bytes));
     println!("Open connections: {open_connections}");
     print_table_sizes("Largest tables", &tables);
+
+    Ok(())
+}
+
+async fn show_mysql_table(conn: &mut AnyConnection, table: &QualifiedName) -> Result<()> {
+    let database_name = table.schema.clone().unwrap_or_else(|| "".to_string());
+
+    let database_name = if database_name.is_empty() {
+        let row = sqlx::query("SELECT DATABASE() AS database_name")
+            .fetch_one(&mut *conn)
+            .await
+            .context("failed to load MySQL database info")?;
+        let database_name: Option<String> = row.try_get("database_name")?;
+        database_name.ok_or_else(|| anyhow!("no MySQL database is selected for this connection"))?
+    } else {
+        database_name
+    };
+
+    let row = sqlx::query(
+        "SELECT COALESCE(table_rows, 0) AS table_rows, COALESCE(data_length + index_length, 0) AS size_bytes \
+         FROM information_schema.tables \
+         WHERE table_schema = ? AND table_name = ? AND table_type = 'BASE TABLE'"
+    )
+    .bind(&database_name)
+    .bind(&table.name)
+    .fetch_optional(&mut *conn)
+    .await
+    .context("failed to load MySQL table stats")?
+    .ok_or_else(|| anyhow!("table `{database_name}.{}` was not found", table.name))?;
+    let table_rows: i64 = row.try_get("table_rows")?;
+    let size_bytes: i64 = row.try_get("size_bytes")?;
+
+    let columns = sqlx::query(
+        "SELECT column_name, column_type, is_nullable, column_default \
+         FROM information_schema.columns \
+         WHERE table_schema = ? AND table_name = ? \
+         ORDER BY ordinal_position",
+    )
+    .bind(&database_name)
+    .bind(&table.name)
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to load MySQL columns")?;
+
+    let columns = columns
+        .into_iter()
+        .map(|row| -> Result<ColumnInfo> {
+            Ok(ColumnInfo {
+                name: row.try_get("column_name")?,
+                data_type: row.try_get("column_type")?,
+                nullable: row.try_get::<String, _>("is_nullable")? == "YES",
+                default_value: row.try_get("column_default")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let indexes = sqlx::query(
+        "SELECT index_name, non_unique, seq_in_index, column_name \
+         FROM information_schema.statistics \
+         WHERE table_schema = ? AND table_name = ? \
+         ORDER BY index_name, seq_in_index",
+    )
+    .bind(&database_name)
+    .bind(&table.name)
+    .fetch_all(&mut *conn)
+    .await
+    .context("failed to load MySQL indexes")?;
+    let indexes = group_index_rows(indexes, "index_name", "column_name", "non_unique")?;
+
+    println!("Backend: mysql");
+    println!("Database: {database_name}");
+    println!("Table: {database_name}.{}", table.name);
+    println!("Estimated rows: {table_rows}");
+    println!("Table size: {}", humanize_bytes(size_bytes));
+    print_columns(&columns);
+    print_indexes(&indexes);
 
     Ok(())
 }
@@ -650,6 +852,71 @@ async fn show_sqlite(conn: &mut AnyConnection, limit: usize) -> Result<()> {
     Ok(())
 }
 
+async fn show_sqlite_table(conn: &mut AnyConnection, table: &QualifiedName) -> Result<()> {
+    if table.schema.is_some() {
+        bail!("sqlite table inspection does not support schema-qualified names");
+    }
+
+    let quoted = quote_identifier(&table.name, DatabaseBackend::Sqlite);
+
+    let row = sqlx::query(&format!("SELECT COUNT(*) AS row_count FROM {quoted}"))
+        .fetch_optional(&mut *conn)
+        .await
+        .with_context(|| format!("failed to inspect SQLite table `{}`", table.name))?
+        .ok_or_else(|| anyhow!("table `{}` was not found", table.name))?;
+    let row_count: i64 = row.try_get("row_count")?;
+
+    let columns = sqlx::query(&format!("PRAGMA table_info({quoted})"))
+        .fetch_all(&mut *conn)
+        .await
+        .context("failed to load SQLite columns")?;
+    let columns = columns
+        .into_iter()
+        .map(|row| -> Result<ColumnInfo> {
+            Ok(ColumnInfo {
+                name: row.try_get("name")?,
+                data_type: row.try_get("type")?,
+                nullable: row.try_get::<i64, _>("notnull")? == 0,
+                default_value: row.try_get("dflt_value")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let index_rows = sqlx::query(&format!("PRAGMA index_list({quoted})"))
+        .fetch_all(&mut *conn)
+        .await
+        .context("failed to load SQLite indexes")?;
+
+    let mut indexes = Vec::with_capacity(index_rows.len());
+    for row in index_rows {
+        let index_name: String = row.try_get("name")?;
+        let unique = row.try_get::<i64, _>("unique")? == 1;
+        let index_quoted = quote_identifier(&index_name, DatabaseBackend::Sqlite);
+        let column_rows = sqlx::query(&format!("PRAGMA index_info({index_quoted})"))
+            .fetch_all(&mut *conn)
+            .await
+            .with_context(|| format!("failed to load SQLite index columns for `{index_name}`"))?;
+        let columns = column_rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<String, _>("name").ok())
+            .collect::<Vec<_>>();
+        indexes.push(IndexInfo {
+            name: index_name,
+            columns,
+            unique,
+        });
+    }
+
+    println!("Backend: sqlite");
+    println!("Table: {}", table.name);
+    println!("Rows: {row_count}");
+    println!("Table size: n/a");
+    print_columns(&columns);
+    print_indexes(&indexes);
+
+    Ok(())
+}
+
 fn print_table_sizes(title: &str, tables: &[TableSize]) {
     println!("{title}:");
     if tables.is_empty() {
@@ -662,6 +929,43 @@ fn print_table_sizes(title: &str, tables: &[TableSize]) {
             Some(size_bytes) => println!("  {} ({})", table.name, humanize_bytes(size_bytes)),
             None => println!("  {}", table.name),
         }
+    }
+}
+
+fn print_columns(columns: &[ColumnInfo]) {
+    println!("Columns:");
+    if columns.is_empty() {
+        println!("  <none>");
+        return;
+    }
+
+    for column in columns {
+        let nullable = if column.nullable { "NULL" } else { "NOT NULL" };
+        match &column.default_value {
+            Some(default_value) => println!(
+                "  {} {} {} DEFAULT {}",
+                column.name, column.data_type, nullable, default_value
+            ),
+            None => println!("  {} {} {}", column.name, column.data_type, nullable),
+        }
+    }
+}
+
+fn print_indexes(indexes: &[IndexInfo]) {
+    println!("Indexes:");
+    if indexes.is_empty() {
+        println!("  <none>");
+        return;
+    }
+
+    for index in indexes {
+        let unique = if index.unique { "UNIQUE " } else { "" };
+        let columns = if index.columns.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            index.columns.join(", ")
+        };
+        println!("  {}{} ({})", unique, index.name, columns);
     }
 }
 
@@ -680,6 +984,71 @@ fn humanize_bytes(bytes: i64) -> String {
     } else {
         format!("{value:.1} {}", units[unit])
     }
+}
+
+fn parse_qualified_name(name: &str) -> Result<QualifiedName> {
+    let parts = name.split('.').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [table] => {
+            validate_identifier(table)?;
+            Ok(QualifiedName {
+                schema: None,
+                name: (*table).to_string(),
+            })
+        }
+        [schema, table] => {
+            validate_identifier(schema)?;
+            validate_identifier(table)?;
+            Ok(QualifiedName {
+                schema: Some((*schema).to_string()),
+                name: (*table).to_string(),
+            })
+        }
+        _ => bail!("table name must be `table` or `schema.table`"),
+    }
+}
+
+fn extract_index_columns(definition: &str) -> Vec<String> {
+    let Some(start) = definition.find('(') else {
+        return Vec::new();
+    };
+    let Some(end) = definition.rfind(')') else {
+        return Vec::new();
+    };
+    definition[start + 1..end]
+        .split(',')
+        .map(|column| column.trim().trim_matches('"').to_string())
+        .filter(|column| !column.is_empty())
+        .collect()
+}
+
+fn group_index_rows(
+    rows: Vec<sqlx::any::AnyRow>,
+    index_name_field: &str,
+    column_name_field: &str,
+    non_unique_field: &str,
+) -> Result<Vec<IndexInfo>> {
+    let mut indexes: Vec<IndexInfo> = Vec::new();
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+
+    for row in rows {
+        let name: String = row.try_get(index_name_field)?;
+        let column: String = row.try_get(column_name_field)?;
+        let unique = row.try_get::<i64, _>(non_unique_field)? == 0;
+
+        if let Some(index) = by_name.get(&name).copied() {
+            indexes[index].columns.push(column);
+        } else {
+            by_name.insert(name.clone(), indexes.len());
+            indexes.push(IndexInfo {
+                name,
+                columns: vec![column],
+                unique,
+            });
+        }
+    }
+
+    Ok(indexes)
 }
 
 async fn wipe(database_url: &str, yes: bool) -> Result<()> {
@@ -1266,9 +1635,10 @@ fn checksum(content: &str) -> String {
 mod tests {
     use super::{
         AppliedMigration, DEFAULT_MIGRATION_TABLE, DOWN_MARKER, DatabaseBackend, RollbackTarget,
-        UP_MARKER, detect_backend, humanize_bytes, infer_table_name, parse_migration_sections,
-        parse_migration_table_name, quote_identifier, resolve_env_file_override,
-        sanitize_migration_name, scaffold_table_migration, select_rollbacks, validate_identifier,
+        UP_MARKER, detect_backend, extract_index_columns, humanize_bytes, infer_table_name,
+        parse_migration_sections, parse_migration_table_name, parse_qualified_name,
+        quote_identifier, resolve_env_file_override, sanitize_migration_name,
+        scaffold_table_migration, select_rollbacks, validate_identifier,
     };
 
     #[test]
@@ -1504,5 +1874,31 @@ mod tests {
         assert_eq!(humanize_bytes(999), "999 B");
         assert_eq!(humanize_bytes(1024), "1.0 KB");
         assert_eq!(humanize_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn parses_qualified_table_name() {
+        let table = parse_qualified_name("public.users").expect("qualified name should parse");
+        assert_eq!(table.schema.as_deref(), Some("public"));
+        assert_eq!(table.name, "users");
+
+        let table = parse_qualified_name("users").expect("simple name should parse");
+        assert_eq!(table.schema, None);
+        assert_eq!(table.name, "users");
+    }
+
+    #[test]
+    fn rejects_invalid_qualified_table_name() {
+        assert!(parse_qualified_name("bad-name").is_err());
+        assert!(parse_qualified_name("a.b.c").is_err());
+    }
+
+    #[test]
+    fn extracts_index_columns_from_definition() {
+        let columns = extract_index_columns(
+            "CREATE UNIQUE INDEX users_email_idx ON public.users USING btree (email, created_at)",
+        );
+
+        assert_eq!(columns, vec!["email".to_string(), "created_at".to_string()]);
     }
 }
