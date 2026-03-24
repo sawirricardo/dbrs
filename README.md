@@ -178,6 +178,12 @@ Roll back one or more migrations:
 dbrs rollback --database-url <DATABASE_URL> --steps 3 --yes
 ```
 
+Roll back until a specific migration version remains applied:
+
+```bash
+dbrs rollback --database-url <DATABASE_URL> --to 2026_03_24_12_30_00.123456 --yes
+```
+
 Reset all tracked migrations:
 
 ```bash

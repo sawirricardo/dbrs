@@ -71,14 +71,16 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
-    /// Revert the latest applied migration
+    /// Revert applied migrations
     Rollback {
         #[arg(long, env = MIGRATIONS_DIR_ENV)]
         dir: Option<PathBuf>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
-        #[arg(long, default_value_t = 1)]
-        steps: usize,
+        #[arg(long, conflicts_with = "to")]
+        steps: Option<usize>,
+        #[arg(long = "to", conflicts_with = "steps")]
+        to: Option<String>,
         #[arg(long)]
         yes: bool,
     },
@@ -144,8 +146,9 @@ async fn main() -> Result<()> {
             dir,
             database_url,
             steps,
+            to,
             yes,
-        } => rollback(dir, &database_url, steps, yes).await?,
+        } => rollback(dir, &database_url, steps, to, yes).await?,
         Commands::Reset {
             dir,
             database_url,
@@ -282,33 +285,49 @@ async fn migrate(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn rollback(dir: Option<PathBuf>, database_url: &str, steps: usize, yes: bool) -> Result<()> {
-    if !yes {
-        bail!("rollback is destructive; re-run with `--yes` to confirm");
-    }
-    if steps == 0 {
-        bail!("rollback steps must be at least 1");
-    }
-
-    run_rollbacks(dir, database_url, Some(steps), "roll back").await
-}
-
 async fn reset(dir: Option<PathBuf>, database_url: &str, yes: bool) -> Result<()> {
     if !yes {
         bail!("reset is destructive; re-run with `--yes` to confirm");
     }
 
-    run_rollbacks(dir, database_url, None, "reset").await
+    run_rollbacks(dir, database_url, RollbackTarget::All, "reset").await
+}
+
+#[derive(Debug, Clone)]
+enum RollbackTarget {
+    Steps(usize),
+    ToVersion(String),
+    All,
+}
+
+async fn rollback(
+    dir: Option<PathBuf>,
+    database_url: &str,
+    steps: Option<usize>,
+    to: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    if !yes {
+        bail!("rollback is destructive; re-run with `--yes` to confirm");
+    }
+
+    let target = match (steps, to) {
+        (Some(0), _) => bail!("rollback steps must be at least 1"),
+        (Some(steps), None) => RollbackTarget::Steps(steps),
+        (None, Some(version)) => RollbackTarget::ToVersion(version),
+        (None, None) => RollbackTarget::Steps(1),
+        (Some(_), Some(_)) => bail!("use either `--steps` or `--to`, not both"),
+    };
+
+    run_rollbacks(dir, database_url, target, "roll back").await
 }
 
 async fn run_rollbacks(
     dir: Option<PathBuf>,
     database_url: &str,
-    steps: Option<usize>,
+    target: RollbackTarget,
     verb: &str,
 ) -> Result<()> {
-    let target_count = steps.unwrap_or(usize::MAX);
-
     let migrations = load_migrations(dir)?;
     let migrations_by_version: HashMap<String, Migration> = migrations
         .into_iter()
@@ -322,17 +341,18 @@ async fn run_rollbacks(
     let applied = load_applied_migration_history(&mut conn, &migration_table).await?;
 
     if applied.is_empty() {
-        if steps.is_some() {
-            println!("No applied migrations to roll back.");
-        } else {
+        if matches!(target, RollbackTarget::All) {
             println!("No applied migrations to reset.");
+        } else {
+            println!("No applied migrations to roll back.");
         }
         return Ok(());
     }
 
+    let selected = select_rollbacks(&applied, &target)?;
     let mut rolled_back = 0usize;
 
-    for applied_migration in applied.into_iter().take(target_count) {
+    for applied_migration in selected {
         let migration = migrations_by_version
             .get(&applied_migration.version)
             .ok_or_else(|| {
@@ -357,6 +377,23 @@ async fn run_rollbacks(
     println!("Completed {verb}: reverted {rolled_back} migration(s).");
 
     Ok(())
+}
+
+fn select_rollbacks(
+    applied: &[AppliedMigration],
+    target: &RollbackTarget,
+) -> Result<Vec<AppliedMigration>> {
+    match target {
+        RollbackTarget::Steps(steps) => Ok(applied.iter().take(*steps).cloned().collect()),
+        RollbackTarget::All => Ok(applied.to_vec()),
+        RollbackTarget::ToVersion(version) => {
+            let Some(index) = applied.iter().position(|item| item.version == *version) else {
+                bail!("target version `{version}` is not currently applied");
+            };
+
+            Ok(applied.iter().take(index).cloned().collect())
+        }
+    }
 }
 
 async fn status(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
@@ -980,10 +1017,10 @@ fn checksum(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MIGRATION_TABLE, DOWN_MARKER, DatabaseBackend, UP_MARKER, detect_backend,
-        infer_table_name, parse_migration_sections, parse_migration_table_name, quote_identifier,
-        resolve_env_file_override, sanitize_migration_name, scaffold_table_migration,
-        validate_identifier,
+        AppliedMigration, DEFAULT_MIGRATION_TABLE, DOWN_MARKER, DatabaseBackend, RollbackTarget,
+        UP_MARKER, detect_backend, infer_table_name, parse_migration_sections,
+        parse_migration_table_name, quote_identifier, resolve_env_file_override,
+        sanitize_migration_name, scaffold_table_migration, select_rollbacks, validate_identifier,
     };
 
     #[test]
@@ -1143,5 +1180,61 @@ mod tests {
             .expect("custom migration table should resolve");
 
         assert_eq!(name, "migrations");
+    }
+
+    #[test]
+    fn rollback_to_version_is_exclusive() {
+        let applied = vec![
+            AppliedMigration {
+                version: "003".to_string(),
+                checksum: "c3".to_string(),
+            },
+            AppliedMigration {
+                version: "002".to_string(),
+                checksum: "c2".to_string(),
+            },
+            AppliedMigration {
+                version: "001".to_string(),
+                checksum: "c1".to_string(),
+            },
+        ];
+
+        let selected = select_rollbacks(&applied, &RollbackTarget::ToVersion("002".to_string()))
+            .expect("selection should succeed");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].version, "003");
+    }
+
+    #[test]
+    fn rollback_to_latest_version_selects_nothing() {
+        let applied = vec![
+            AppliedMigration {
+                version: "003".to_string(),
+                checksum: "c3".to_string(),
+            },
+            AppliedMigration {
+                version: "002".to_string(),
+                checksum: "c2".to_string(),
+            },
+        ];
+
+        let selected = select_rollbacks(&applied, &RollbackTarget::ToVersion("003".to_string()))
+            .expect("selection should succeed");
+
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn rollback_to_unknown_version_fails() {
+        let applied = vec![AppliedMigration {
+            version: "003".to_string(),
+            checksum: "c3".to_string(),
+        }];
+
+        let err = select_rollbacks(&applied, &RollbackTarget::ToVersion("001".to_string()))
+            .expect_err("selection should fail");
+
+        assert!(err.to_string().contains("not currently applied"));
     }
 }
