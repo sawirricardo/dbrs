@@ -156,6 +156,8 @@ Global options:
 - `--env-file <ENV_FILE>` or `DBRS_ENV_FILE`
 - `--quiet` or `-q` to suppress streamed progress output and show only summaries/errors
 - `--json` for newline-delimited JSON event output on stdout for CI/agents
+- `--wait` to poll until the database accepts connections before running a DB-backed command
+- `--wait-timeout <secs>` and `--wait-interval <secs>` to control readiness polling
 - `--quiet` and `--json` are mutually exclusive
 
 Progress output:
@@ -163,6 +165,7 @@ Progress output:
 - `migrate`, `rollback`, `reset`, `wipe`, and `fresh` print live progress by default
 - use `--quiet` for summary-only output
 - use `--json` for machine-readable NDJSON events
+- use `--wait` when your database may still be starting up
 
 Create a migration:
 
@@ -181,6 +184,12 @@ Apply pending migrations:
 
 ```bash
 dbrs migrate --database-url <DATABASE_URL>
+```
+
+Wait for the database first if needed:
+
+```bash
+dbrs --wait --wait-timeout 60 migrate --database-url <DATABASE_URL>
 ```
 
 Options:
@@ -426,6 +435,15 @@ scripts/smoke-test.sh \
   --mysql-url mysql://root:root@localhost:3306/testing
 ```
 
+If your databases may still be starting up, wait for readiness first:
+
+```bash
+scripts/smoke-test.sh \
+  --postgres-url postgres://postgres@localhost:5432/testing \
+  --mysql-url mysql://root:root@localhost:3306/testing \
+  --wait
+```
+
 Destructive coverage for disposable databases only:
 
 ```bash
@@ -437,6 +455,7 @@ scripts/smoke-test.sh \
 
 The smoke script verifies `migrate`, `status`, `show`, `table`, JSON output, `rollback`, and `reset`.
 With `--allow-destructive`, it also verifies `fresh` and `wipe`.
+The script-level `--wait` is useful when orchestrating fresh databases; `dbrs` itself also supports `--wait`, `--wait-timeout <secs>`, and `--wait-interval <secs>`.
 
 Run locally:
 

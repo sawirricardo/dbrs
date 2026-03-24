@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -30,6 +30,12 @@ struct Cli {
     quiet: bool,
     #[arg(long, global = true, conflicts_with = "quiet")]
     json: bool,
+    #[arg(long, global = true)]
+    wait: bool,
+    #[arg(long, global = true, default_value_t = 60)]
+    wait_timeout: u64,
+    #[arg(long, global = true, default_value_t = 2)]
+    wait_interval: u64,
     #[command(subcommand)]
     command: Commands,
 }
@@ -144,6 +150,13 @@ enum OutputMode {
     Json,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WaitOptions {
+    enabled: bool,
+    timeout: Duration,
+    interval: Duration,
+}
+
 fn json_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -211,6 +224,11 @@ async fn main() -> Result<()> {
     } else {
         OutputMode::Human
     };
+    let wait = WaitOptions {
+        enabled: cli.wait,
+        timeout: Duration::from_secs(cli.wait_timeout),
+        interval: Duration::from_secs(cli.wait_interval.max(1)),
+    };
 
     match cli.command {
         Commands::New {
@@ -219,31 +237,31 @@ async fn main() -> Result<()> {
             table,
             backend,
         } => create_new_migration(dir, &name, table, backend)?,
-        Commands::Migrate { dir, database_url } => migrate(dir, &database_url, output).await?,
-        Commands::Status { dir, database_url } => status(dir, &database_url, output).await?,
+        Commands::Migrate { dir, database_url } => migrate(dir, &database_url, output, wait).await?,
+        Commands::Status { dir, database_url } => status(dir, &database_url, output, wait).await?,
         Commands::Show {
             database_url,
             limit,
-        } => show(&database_url, limit, output).await?,
-        Commands::Table { name, database_url } => table(&name, &database_url, output).await?,
+        } => show(&database_url, limit, output, wait).await?,
+        Commands::Table { name, database_url } => table(&name, &database_url, output, wait).await?,
         Commands::Fresh {
             dir,
             database_url,
             yes,
-        } => fresh(dir, &database_url, yes, output).await?,
-        Commands::Wipe { database_url, yes } => wipe(&database_url, yes, output).await?,
+        } => fresh(dir, &database_url, yes, output, wait).await?,
+        Commands::Wipe { database_url, yes } => wipe(&database_url, yes, output, wait).await?,
         Commands::Rollback {
             dir,
             database_url,
             steps,
             to,
             yes,
-        } => rollback(dir, &database_url, steps, to, yes, output).await?,
+        } => rollback(dir, &database_url, steps, to, yes, output, wait).await?,
         Commands::Reset {
             dir,
             database_url,
             yes,
-        } => reset(dir, &database_url, yes, output).await?,
+        } => reset(dir, &database_url, yes, output, wait).await?,
     }
 
     Ok(())
@@ -368,11 +386,11 @@ fn create_new_migration(
     Ok(())
 }
 
-async fn migrate(dir: Option<PathBuf>, database_url: &str, output: OutputMode) -> Result<()> {
+async fn migrate(dir: Option<PathBuf>, database_url: &str, output: OutputMode, wait: WaitOptions) -> Result<()> {
     let total_started_at = Instant::now();
     let migrations = load_migrations(dir)?;
     let backend = detect_backend(database_url)?;
-    let mut conn = connect(database_url).await?;
+    let mut conn = connect(database_url, output, wait, "migrate").await?;
     let migration_table = resolve_migration_table_name()?;
 
     ensure_migration_table(&mut conn, &migration_table, backend).await?;
@@ -474,12 +492,12 @@ async fn migrate(dir: Option<PathBuf>, database_url: &str, output: OutputMode) -
     Ok(())
 }
 
-async fn reset(dir: Option<PathBuf>, database_url: &str, yes: bool, output: OutputMode) -> Result<()> {
+async fn reset(dir: Option<PathBuf>, database_url: &str, yes: bool, output: OutputMode, wait: WaitOptions) -> Result<()> {
     if !yes {
         bail!("reset is destructive; re-run with `--yes` to confirm");
     }
 
-    run_rollbacks(dir, database_url, RollbackTarget::All, "reset", output).await
+    run_rollbacks(dir, database_url, RollbackTarget::All, "reset", output, wait).await
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +514,7 @@ async fn rollback(
     to: Option<String>,
     yes: bool,
     output: OutputMode,
+    wait: WaitOptions,
 ) -> Result<()> {
     if !yes {
         bail!("rollback is destructive; re-run with `--yes` to confirm");
@@ -509,7 +528,7 @@ async fn rollback(
         (Some(_), Some(_)) => bail!("use either `--steps` or `--to`, not both"),
     };
 
-    run_rollbacks(dir, database_url, target, "roll back", output).await
+    run_rollbacks(dir, database_url, target, "roll back", output, wait).await
 }
 
 async fn run_rollbacks(
@@ -518,6 +537,7 @@ async fn run_rollbacks(
     target: RollbackTarget,
     verb: &str,
     output: OutputMode,
+    wait: WaitOptions,
 ) -> Result<()> {
     let total_started_at = Instant::now();
     let migrations = load_migrations(dir)?;
@@ -527,7 +547,7 @@ async fn run_rollbacks(
         .collect();
 
     let backend = detect_backend(database_url)?;
-    let mut conn = connect(database_url).await?;
+    let mut conn = connect(database_url, output, wait, verb).await?;
     let migration_table = resolve_migration_table_name()?;
     ensure_migration_table(&mut conn, &migration_table, backend).await?;
 
@@ -675,10 +695,10 @@ fn select_rollbacks(
     }
 }
 
-async fn status(dir: Option<PathBuf>, database_url: &str, output: OutputMode) -> Result<()> {
+async fn status(dir: Option<PathBuf>, database_url: &str, output: OutputMode, wait: WaitOptions) -> Result<()> {
     let migrations = load_migrations(dir)?;
     let backend = detect_backend(database_url)?;
-    let mut conn = connect(database_url).await?;
+    let mut conn = connect(database_url, output, wait, "status").await?;
     let migration_table = resolve_migration_table_name()?;
 
     ensure_migration_table(&mut conn, &migration_table, backend).await?;
@@ -754,12 +774,12 @@ async fn status(dir: Option<PathBuf>, database_url: &str, output: OutputMode) ->
     Ok(())
 }
 
-async fn show(database_url: &str, limit: usize, output: OutputMode) -> Result<()> {
+async fn show(database_url: &str, limit: usize, output: OutputMode, wait: WaitOptions) -> Result<()> {
     if limit == 0 {
         bail!("show limit must be at least 1");
     }
 
-    let mut conn = connect(database_url).await?;
+    let mut conn = connect(database_url, output, wait, "show").await?;
 
     match detect_backend(database_url)? {
         DatabaseBackend::Postgres => show_postgres(&mut conn, limit, output).await?,
@@ -770,9 +790,9 @@ async fn show(database_url: &str, limit: usize, output: OutputMode) -> Result<()
     Ok(())
 }
 
-async fn table(name: &str, database_url: &str, output: OutputMode) -> Result<()> {
+async fn table(name: &str, database_url: &str, output: OutputMode, wait: WaitOptions) -> Result<()> {
     let table = parse_qualified_name(name)?;
-    let mut conn = connect(database_url).await?;
+    let mut conn = connect(database_url, output, wait, "table").await?;
 
     match detect_backend(database_url)? {
         DatabaseBackend::Postgres => show_postgres_table(&mut conn, &table, output).await?,
@@ -1568,7 +1588,7 @@ fn group_index_rows(
     Ok(indexes)
 }
 
-async fn wipe(database_url: &str, yes: bool, output: OutputMode) -> Result<()> {
+async fn wipe(database_url: &str, yes: bool, output: OutputMode, wait: WaitOptions) -> Result<()> {
     if !yes {
         bail!("wipe is destructive; re-run with `--yes` to confirm");
     }
@@ -1583,7 +1603,7 @@ async fn wipe(database_url: &str, yes: bool, output: OutputMode) -> Result<()> {
         OutputMode::Quiet => {}
     }
     let started_at = Instant::now();
-    let mut conn = connect(database_url).await?;
+    let mut conn = connect(database_url, output, wait, "wipe").await?;
 
     match detect_backend(database_url)? {
         DatabaseBackend::Postgres => wipe_postgres(&mut conn).await?,
@@ -1610,7 +1630,7 @@ async fn wipe(database_url: &str, yes: bool, output: OutputMode) -> Result<()> {
     Ok(())
 }
 
-async fn fresh(dir: Option<PathBuf>, database_url: &str, yes: bool, output: OutputMode) -> Result<()> {
+async fn fresh(dir: Option<PathBuf>, database_url: &str, yes: bool, output: OutputMode, wait: WaitOptions) -> Result<()> {
     if !yes {
         bail!("fresh is destructive; re-run with `--yes` to confirm");
     }
@@ -1625,7 +1645,7 @@ async fn fresh(dir: Option<PathBuf>, database_url: &str, yes: bool, output: Outp
         OutputMode::Quiet => {}
     }
     let wipe_started_at = Instant::now();
-    let mut conn = connect(database_url).await?;
+    let mut conn = connect(database_url, output, wait, "fresh").await?;
 
     match detect_backend(database_url)? {
         DatabaseBackend::Postgres => wipe_postgres(&mut conn).await?,
@@ -1647,7 +1667,7 @@ async fn fresh(dir: Option<PathBuf>, database_url: &str, yes: bool, output: Outp
         OutputMode::Quiet => {}
     }
     let migrate_started_at = Instant::now();
-    migrate(dir, database_url, output).await?;
+    migrate(dir, database_url, output, wait).await?;
     match output {
         OutputMode::Human => {
             println!("[2/2] Done running migrations in {:.2}s", migrate_started_at.elapsed().as_secs_f64());
@@ -1671,12 +1691,62 @@ async fn fresh(dir: Option<PathBuf>, database_url: &str, yes: bool, output: Outp
     Ok(())
 }
 
-async fn connect(database_url: &str) -> Result<AnyConnection> {
+async fn connect(
+    database_url: &str,
+    output: OutputMode,
+    wait: WaitOptions,
+    command: &str,
+) -> Result<AnyConnection> {
     let normalized_url = normalize_database_url(database_url);
 
-    AnyConnection::connect(&normalized_url)
-        .await
-        .with_context(|| format!("failed to connect to database at {database_url}"))
+    if !wait.enabled {
+        return AnyConnection::connect(&normalized_url)
+            .await
+            .with_context(|| format!("failed to connect to database at {database_url}"));
+    }
+
+    match output {
+        OutputMode::Human => println!(
+            "Waiting for database readiness (timeout: {:.0}s, interval: {:.0}s)...",
+            wait.timeout.as_secs_f64(),
+            wait.interval.as_secs_f64()
+        ),
+        OutputMode::Json => print_json_event(vec![
+            json_str_field("event", "waiting_for_database"),
+            json_str_field("command", command),
+            json_f64_field("timeout_seconds", wait.timeout.as_secs_f64()),
+            json_f64_field("interval_seconds", wait.interval.as_secs_f64()),
+        ]),
+        OutputMode::Quiet => {}
+    }
+
+    let started_at = Instant::now();
+    loop {
+        match AnyConnection::connect(&normalized_url).await {
+            Ok(conn) => {
+                match output {
+                    OutputMode::Human => println!(
+                        "Database ready after {:.2}s.",
+                        started_at.elapsed().as_secs_f64()
+                    ),
+                    OutputMode::Json => print_json_event(vec![
+                        json_str_field("event", "database_ready"),
+                        json_str_field("command", command),
+                        json_f64_field("waited_seconds", started_at.elapsed().as_secs_f64()),
+                    ]),
+                    OutputMode::Quiet => {}
+                }
+                return Ok(conn);
+            }
+            Err(err) => {
+                if started_at.elapsed() >= wait.timeout {
+                    return Err(err)
+                        .with_context(|| format!("timed out waiting for database at {database_url}"));
+                }
+                tokio::time::sleep(wait.interval).await;
+            }
+        }
+    }
 }
 
 fn normalize_database_url(database_url: &str) -> String {

@@ -9,6 +9,9 @@ MYSQL_URL="${MYSQL_SMOKE_URL:-}"
 ALLOW_DESTRUCTIVE=0
 RUN_POSTGRES=0
 RUN_MYSQL=0
+WAIT_FOR_DB=0
+WAIT_TIMEOUT_SECONDS="${SMOKE_WAIT_TIMEOUT_SECONDS:-60}"
+WAIT_INTERVAL_SECONDS="${SMOKE_WAIT_INTERVAL_SECONDS:-2}"
 
 usage() {
   cat <<'EOF'
@@ -20,16 +23,22 @@ Options:
   --postgres-only          Run only the Postgres smoke test
   --mysql-only             Run only the MySQL smoke test
   --allow-destructive      Also run fresh and wipe (use only on disposable databases)
+  --wait                   Wait for each database to become ready before testing
+  --wait-timeout <secs>    Max seconds to wait for readiness (default: 60)
+  --wait-interval <secs>   Poll interval while waiting (default: 2)
   -h, --help               Show this help
 
 Environment:
   POSTGRES_SMOKE_URL       Default Postgres URL
   MYSQL_SMOKE_URL          Default MySQL URL
+  SMOKE_WAIT_TIMEOUT_SECONDS   Default readiness timeout
+  SMOKE_WAIT_INTERVAL_SECONDS  Default readiness poll interval
 
 Notes:
   - Non-destructive mode tests: migrate, status, show, table, rollback, reset, and JSON output.
   - Destructive mode additionally tests: fresh and wipe.
   - fresh/wipe will remove all tables in the target database. Use a disposable database only.
+  - --wait forwards readiness polling flags to dbrs itself.
 EOF
 }
 
@@ -54,6 +63,18 @@ while [[ $# -gt 0 ]]; do
     --allow-destructive)
       ALLOW_DESTRUCTIVE=1
       shift
+      ;;
+    --wait)
+      WAIT_FOR_DB=1
+      shift
+      ;;
+    --wait-timeout)
+      WAIT_TIMEOUT_SECONDS="${2:?missing value for --wait-timeout}"
+      shift 2
+      ;;
+    --wait-interval)
+      WAIT_INTERVAL_SECONDS="${2:?missing value for --wait-interval}"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -156,24 +177,29 @@ EOF
   export DATABASE_URL="$url"
   export DBRS_MIGRATION_TABLE="$migration_table"
 
-  run_cmd cargo run -q -- migrate --dir "$dir"
-  run_cmd cargo run -q -- status --dir "$dir"
-  run_cmd cargo run -q -- show --limit 10
-  run_cmd cargo run -q -- table "$table"
+  local wait_args=()
+  if [[ "$WAIT_FOR_DB" -eq 1 ]]; then
+    wait_args+=(--wait --wait-timeout "$WAIT_TIMEOUT_SECONDS" --wait-interval "$WAIT_INTERVAL_SECONDS")
+  fi
 
-  run_cmd cargo run -q -- --json status --dir "$dir"
-  run_cmd cargo run -q -- --json show --limit 5
-  run_cmd cargo run -q -- --json table "$table"
+  run_cmd cargo run -q -- "${wait_args[@]}" migrate --dir "$dir"
+  run_cmd cargo run -q -- "${wait_args[@]}" status --dir "$dir"
+  run_cmd cargo run -q -- "${wait_args[@]}" show --limit 10
+  run_cmd cargo run -q -- "${wait_args[@]}" table "$table"
 
-  run_cmd cargo run -q -- rollback --dir "$dir" --steps 1 --yes
-  run_cmd cargo run -q -- status --dir "$dir"
-  run_cmd cargo run -q -- reset --dir "$dir" --yes
-  run_cmd cargo run -q -- status --dir "$dir"
+  run_cmd cargo run -q -- --json "${wait_args[@]}" status --dir "$dir"
+  run_cmd cargo run -q -- --json "${wait_args[@]}" show --limit 5
+  run_cmd cargo run -q -- --json "${wait_args[@]}" table "$table"
+
+  run_cmd cargo run -q -- "${wait_args[@]}" rollback --dir "$dir" --steps 1 --yes
+  run_cmd cargo run -q -- "${wait_args[@]}" status --dir "$dir"
+  run_cmd cargo run -q -- "${wait_args[@]}" reset --dir "$dir" --yes
+  run_cmd cargo run -q -- "${wait_args[@]}" status --dir "$dir"
 
   if [[ "$ALLOW_DESTRUCTIVE" -eq 1 ]]; then
     echo "--- destructive checks enabled ---"
-    run_cmd cargo run -q -- fresh --dir "$dir" --yes
-    run_cmd cargo run -q -- wipe --yes
+    run_cmd cargo run -q -- "${wait_args[@]}" fresh --dir "$dir" --yes
+    run_cmd cargo run -q -- "${wait_args[@]}" wipe --yes
   else
     echo "--- destructive checks skipped (pass --allow-destructive to enable fresh/wipe) ---"
   fi
