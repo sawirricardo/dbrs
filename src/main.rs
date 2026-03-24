@@ -20,7 +20,7 @@ const DATABASE_URL_ENV: &str = "DATABASE_URL";
 const ENV_FILE_ENV: &str = "DBRS_ENV_FILE";
 
 #[derive(Parser, Debug)]
-#[command(name = "dbrs", about = "A small SQL migration tool")]
+#[command(name = "dbrs", about = "A small SQL migration tool", version)]
 struct Cli {
     #[arg(long, global = true, env = ENV_FILE_ENV)]
     env_file: Option<PathBuf>,

@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BINARY_NAME: dbrs
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            binary: dbrs
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            binary: dbrs
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            binary: dbrs
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            binary: dbrs.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package archive
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${BINARY_NAME}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" \
+            "${{ matrix.binary }}"
+        shell: bash
+
+      - name: Package archive
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive `
+            -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" `
+            -DestinationPath "dist/${env:BINARY_NAME}-${{ matrix.target }}.zip"
+        shell: pwsh
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Resolve release metadata
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "title=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "notes=Release ${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=edge" >> "$GITHUB_OUTPUT"
+            echo "title=Edge build" >> "$GITHUB_OUTPUT"
+            echo "notes=Automated edge build from ${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Update edge tag
+        if: github.ref_type == 'branch'
+        run: |
+          git tag -f "${{ steps.meta.outputs.tag }}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${{ steps.meta.outputs.tag }}" --force
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.meta.outputs.title }}
+          RELEASE_NOTES: ${{ steps.meta.outputs.notes }}
+          RELEASE_PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          RELEASE_LATEST: ${{ steps.meta.outputs.make_latest }}
+        run: |
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --clobber
+            edit_args=(
+              "${RELEASE_TAG}"
+              --title "${RELEASE_TITLE}"
+              --notes "${RELEASE_NOTES}"
+            )
+            if [[ "${RELEASE_LATEST}" == "true" ]]; then
+              edit_args+=(--latest)
+            fi
+            gh release edit "${edit_args[@]}"
+          else
+            create_args=(
+              "${RELEASE_TAG}"
+              dist/*
+              --title "${RELEASE_TITLE}"
+              --notes "${RELEASE_NOTES}"
+            )
+            if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+              create_args+=(--prerelease)
+            fi
+            if [[ "${RELEASE_LATEST}" == "true" ]]; then
+              create_args+=(--latest)
+            fi
+            gh release create "${create_args[@]}"
+          fi
