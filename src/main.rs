@@ -77,6 +77,8 @@ enum Commands {
         dir: Option<PathBuf>,
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -121,7 +123,11 @@ async fn main() -> Result<()> {
             yes,
         } => fresh(dir, &database_url, yes).await?,
         Commands::Wipe { database_url, yes } => wipe(&database_url, yes).await?,
-        Commands::Rollback { dir, database_url } => rollback(dir, &database_url).await?,
+        Commands::Rollback {
+            dir,
+            database_url,
+            yes,
+        } => rollback(dir, &database_url, yes).await?,
     }
 
     Ok(())
@@ -253,7 +259,11 @@ async fn migrate(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn rollback(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
+async fn rollback(dir: Option<PathBuf>, database_url: &str, yes: bool) -> Result<()> {
+    if !yes {
+        bail!("rollback is destructive; re-run with `--yes` to confirm");
+    }
+
     let migrations = load_migrations(dir)?;
     let migrations_by_version: HashMap<String, Migration> = migrations
         .into_iter()
