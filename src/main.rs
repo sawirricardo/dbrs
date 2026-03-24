@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -297,6 +298,7 @@ fn create_new_migration(
 }
 
 async fn migrate(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
+    let total_started_at = Instant::now();
     let migrations = load_migrations(dir)?;
     let mut conn = connect(database_url).await?;
     let migration_table = resolve_migration_table_name()?;
@@ -329,16 +331,24 @@ async fn migrate(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
             continue;
         }
 
+        let current = applied_now + 1;
         println!(
-            "Running {} ({})...",
+            "[{current}/{pending}] Running {} ({})...",
             migration.version, migration.name
         );
+        let started_at = Instant::now();
         apply_migration(&mut conn, &migration_table, &migration).await?;
         applied_now += 1;
-        println!("Done {} ({})", migration.version, migration.name);
+        println!(
+            "[{current}/{pending}] Done {} ({}) in {:.2}s",
+            migration.version,
+            migration.name,
+            started_at.elapsed().as_secs_f64()
+        );
     }
 
     println!("Applied {applied_now} migration(s).");
+    println!("Total migrate time: {:.2}s", total_started_at.elapsed().as_secs_f64());
 
     Ok(())
 }
@@ -386,6 +396,7 @@ async fn run_rollbacks(
     target: RollbackTarget,
     verb: &str,
 ) -> Result<()> {
+    let total_started_at = Instant::now();
     let migrations = load_migrations(dir)?;
     let migrations_by_version: HashMap<String, Migration> = migrations
         .into_iter()
@@ -408,6 +419,19 @@ async fn run_rollbacks(
     }
 
     let selected = select_rollbacks(&applied, &target)?;
+    let total = selected.len();
+
+    if total == 0 {
+        if matches!(target, RollbackTarget::ToVersion(_)) {
+            println!("No migrations need to be rolled back.");
+        } else {
+            println!("No applied migrations to {verb}.");
+        }
+        return Ok(());
+    }
+
+    println!("Running {total} rollback migration(s)...");
+
     let mut rolled_back = 0usize;
 
     for applied_migration in selected {
@@ -427,12 +451,24 @@ async fn run_rollbacks(
             );
         }
 
+        let current = rolled_back + 1;
+        println!(
+            "[{current}/{total}] Rolling back {} ({})...",
+            migration.version, migration.name
+        );
+        let started_at = Instant::now();
         rollback_migration(&mut conn, &migration_table, migration).await?;
-        println!("Rolled back {} ({})", migration.version, migration.name);
         rolled_back += 1;
+        println!(
+            "[{current}/{total}] Done {} ({}) in {:.2}s",
+            migration.version,
+            migration.name,
+            started_at.elapsed().as_secs_f64()
+        );
     }
 
     println!("Completed {verb}: reverted {rolled_back} migration(s).");
+    println!("Total {verb} time: {:.2}s", total_started_at.elapsed().as_secs_f64());
 
     Ok(())
 }
@@ -1069,6 +1105,9 @@ async fn wipe(database_url: &str, yes: bool) -> Result<()> {
         bail!("wipe is destructive; re-run with `--yes` to confirm");
     }
 
+    let total_started_at = Instant::now();
+    println!("[1/1] Wiping database...");
+    let started_at = Instant::now();
     let mut conn = connect(database_url).await?;
 
     match detect_backend(database_url)? {
@@ -1077,7 +1116,9 @@ async fn wipe(database_url: &str, yes: bool) -> Result<()> {
         DatabaseBackend::Sqlite => wipe_sqlite(&mut conn).await?,
     }
 
+    println!("[1/1] Done wiping database in {:.2}s", started_at.elapsed().as_secs_f64());
     println!("Database wiped.");
+    println!("Total wipe time: {:.2}s", total_started_at.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -1086,8 +1127,24 @@ async fn fresh(dir: Option<PathBuf>, database_url: &str, yes: bool) -> Result<()
         bail!("fresh is destructive; re-run with `--yes` to confirm");
     }
 
-    wipe(database_url, true).await?;
-    migrate(dir, database_url).await
+    let total_started_at = Instant::now();
+    println!("[1/2] Wiping database...");
+    let wipe_started_at = Instant::now();
+    let mut conn = connect(database_url).await?;
+
+    match detect_backend(database_url)? {
+        DatabaseBackend::Postgres => wipe_postgres(&mut conn).await?,
+        DatabaseBackend::MySql => wipe_mysql(&mut conn).await?,
+        DatabaseBackend::Sqlite => wipe_sqlite(&mut conn).await?,
+    }
+
+    println!("[1/2] Done wiping database in {:.2}s", wipe_started_at.elapsed().as_secs_f64());
+    println!("[2/2] Running migrations...");
+    let migrate_started_at = Instant::now();
+    migrate(dir, database_url).await?;
+    println!("[2/2] Done running migrations in {:.2}s", migrate_started_at.elapsed().as_secs_f64());
+    println!("Total fresh time: {:.2}s", total_started_at.elapsed().as_secs_f64());
+    Ok(())
 }
 
 async fn connect(database_url: &str) -> Result<AnyConnection> {
