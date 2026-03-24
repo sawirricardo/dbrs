@@ -16,6 +16,8 @@ It creates timestamped migration files, applies pending migrations, tracks appli
 - `reset` to revert all tracked migrations
 - `wipe` to reset the current database without dropping the database itself
 - `fresh` to wipe and then re-run all migrations
+- Streamed progress output for `migrate`, `rollback`, `reset`, `wipe`, and `fresh`
+- Global `--quiet` / `-q` flag for summary-only output
 - `.env` support, including custom env file paths
 - Configurable migration directory and migration table name
 - Opt-in table scaffolding for `create_*` migrations
@@ -148,6 +150,16 @@ DROP TABLE users;
 
 ## Commands
 
+Global options:
+
+- `--env-file <ENV_FILE>` or `DBRS_ENV_FILE`
+- `--quiet` or `-q` to suppress streamed progress output and show only summaries/errors
+
+Progress output:
+
+- `migrate`, `rollback`, `reset`, `wipe`, and `fresh` print live progress by default
+- use `--quiet` for summary-only output
+
 Create a migration:
 
 ```bash
@@ -172,6 +184,19 @@ Options:
 - `--dir <DIR>` or `DBRS_MIGRATIONS_DIR`
 - `--env-file <ENV_FILE>` or `DBRS_ENV_FILE`
 - `--database-url <DATABASE_URL>` or `DATABASE_URL`
+- `--quiet` or `-q`
+
+Example output:
+
+```text
+Running 2 pending migration(s)...
+[1/2] Running 2026_03_24_120000 (create-users)...
+[1/2] Done 2026_03_24_120000 (create-users) in 0.03s
+[2/2] Running 2026_03_24_120100 (add-email-index)...
+[2/2] Done 2026_03_24_120100 (add-email-index) in 0.01s
+Applied 2 migration(s).
+Total migrate time: 0.05s
+```
 
 Show status:
 
@@ -214,6 +239,10 @@ Roll back one or more migrations:
 dbrs rollback --database-url <DATABASE_URL> --steps 3 --yes
 ```
 
+Options:
+
+- `--quiet` or `-q`
+
 Roll back until a specific migration version remains applied:
 
 ```bash
@@ -226,17 +255,29 @@ Reset all tracked migrations:
 dbrs reset --database-url <DATABASE_URL> --yes
 ```
 
+Options:
+
+- `--quiet` or `-q`
+
 Wipe the current database contents:
 
 ```bash
 dbrs wipe --database-url <DATABASE_URL> --yes
 ```
 
+Options:
+
+- `--quiet` or `-q`
+
 Fresh database from migrations:
 
 ```bash
 dbrs fresh --database-url <DATABASE_URL> --yes
 ```
+
+Options:
+
+- `--quiet` or `-q`
 
 ## Environment
 
