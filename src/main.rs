@@ -1,13 +1,14 @@
 use std::{
     collections::HashMap,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
-use clap::{Parser, Subcommand};
-use dotenvy::dotenv;
+use clap::{Parser, Subcommand, ValueEnum};
+use dotenvy::{dotenv, from_path};
 use sha2::{Digest, Sha256};
 use sqlx::{Any, AnyConnection, Connection, QueryBuilder, Row, any::install_default_drivers};
 
@@ -15,10 +16,14 @@ const MIGRATION_TABLE: &str = "dbrs_migrations";
 const UP_MARKER: &str = "-- dbrs:up";
 const DOWN_MARKER: &str = "-- dbrs:down";
 const MIGRATIONS_DIR_ENV: &str = "DBRS_MIGRATIONS_DIR";
+const DATABASE_URL_ENV: &str = "DATABASE_URL";
+const ENV_FILE_ENV: &str = "DBRS_ENV_FILE";
 
 #[derive(Parser, Debug)]
 #[command(name = "dbrs", about = "A small SQL migration tool")]
 struct Cli {
+    #[arg(long, global = true, env = ENV_FILE_ENV)]
+    env_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -30,6 +35,10 @@ enum Commands {
         name: String,
         #[arg(long, env = MIGRATIONS_DIR_ENV)]
         dir: Option<PathBuf>,
+        #[arg(long)]
+        table: bool,
+        #[arg(long, value_enum)]
+        backend: Option<DatabaseBackend>,
     },
     /// Apply pending migrations
     Migrate {
@@ -70,9 +79,10 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DatabaseBackend {
     Postgres,
+    #[value(name = "mysql", alias = "my-sql")]
     MySql,
     Sqlite,
 }
@@ -90,12 +100,18 @@ struct Migration {
 #[tokio::main]
 async fn main() -> Result<()> {
     install_default_drivers();
-    let _ = dotenv();
+    load_dotenv_file()?;
 
     let cli = Cli::parse();
+    let _ = cli.env_file.as_ref();
 
     match cli.command {
-        Commands::New { name, dir } => create_new_migration(dir, &name)?,
+        Commands::New {
+            name,
+            dir,
+            table,
+            backend,
+        } => create_new_migration(dir, &name, table, backend)?,
         Commands::Migrate { dir, database_url } => migrate(dir, &database_url).await?,
         Commands::Status { dir, database_url } => status(dir, &database_url).await?,
         Commands::Fresh {
@@ -110,7 +126,51 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn create_new_migration(dir: Option<PathBuf>, name: &str) -> Result<()> {
+fn load_dotenv_file() -> Result<()> {
+    if let Some(path) = resolve_env_file_override(std::env::args_os()) {
+        from_path(&path)
+            .with_context(|| format!("failed to load environment file {}", path.display()))?;
+        return Ok(());
+    }
+
+    if let Ok(path) = std::env::var(ENV_FILE_ENV) {
+        let path = PathBuf::from(path);
+        from_path(&path)
+            .with_context(|| format!("failed to load environment file {}", path.display()))?;
+        return Ok(());
+    }
+
+    let _ = dotenv();
+    Ok(())
+}
+
+fn resolve_env_file_override<I>(args: I) -> Option<PathBuf>
+where
+    I: IntoIterator,
+    I::Item: Into<OsString>,
+{
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        let arg: OsString = arg.into();
+        if arg == "--env-file" {
+            return args.next().map(|value| PathBuf::from(value.into()));
+        }
+
+        if let Some(value) = arg.to_str().and_then(|arg| arg.strip_prefix("--env-file=")) {
+            return Some(PathBuf::from(value));
+        }
+    }
+
+    None
+}
+
+fn create_new_migration(
+    dir: Option<PathBuf>,
+    name: &str,
+    table: bool,
+    backend_override: Option<DatabaseBackend>,
+) -> Result<()> {
     let migrations_dir = resolve_migrations_dir(dir)?;
     fs::create_dir_all(&migrations_dir).with_context(|| {
         format!(
@@ -131,14 +191,30 @@ fn create_new_migration(dir: Option<PathBuf>, name: &str) -> Result<()> {
         bail!("migration already exists: {}", path.display());
     }
 
-    let template = format!(
-        "{UP_MARKER}\n\n-- write your forward migration here\n\n{DOWN_MARKER}\n\n-- write the rollback for this migration here\n"
-    );
+    let inferred_table_name = infer_table_name(&slug);
+    let template = if table {
+        let table_name = inferred_table_name.as_deref().ok_or_else(|| {
+            anyhow!(
+                "`--table` expects a migration name like `create_users` or `create_users_table`"
+            )
+        })?;
+        let backend = resolve_scaffold_backend(backend_override)?;
+        scaffold_table_migration(table_name, backend)
+    } else {
+        empty_migration_template()
+    };
 
     fs::write(&path, template)
         .with_context(|| format!("failed to write migration file {}", path.display()))?;
 
     println!("{}", path.display());
+    if !table {
+        if let Some(table_name) = inferred_table_name {
+            eprintln!(
+                "Hint: migration name looks like a table creation. Re-run with `--table` to scaffold `{table_name}`."
+            );
+        }
+    }
     Ok(())
 }
 
@@ -457,6 +533,90 @@ fn quote_identifier(name: &str, backend: DatabaseBackend) -> String {
     }
 }
 
+fn empty_migration_template() -> String {
+    format!(
+        "{UP_MARKER}\n\n-- write your forward migration here\n\n{DOWN_MARKER}\n\n-- write the rollback for this migration here\n"
+    )
+}
+
+fn infer_table_name(slug: &str) -> Option<String> {
+    let remainder = slug.strip_prefix("create-")?;
+    let candidate = remainder.strip_suffix("-table").unwrap_or(remainder);
+
+    if candidate.is_empty() {
+        return None;
+    }
+
+    let disallowed_prefixes = [
+        "index-",
+        "view-",
+        "enum-",
+        "type-",
+        "extension-",
+        "function-",
+        "domain-",
+        "schema-",
+        "trigger-",
+        "sequence-",
+        "materialized-view-",
+    ];
+
+    let disallowed_suffixes = [
+        "-index",
+        "-view",
+        "-enum",
+        "-type",
+        "-extension",
+        "-function",
+        "-domain",
+        "-schema",
+        "-trigger",
+        "-sequence",
+    ];
+
+    if disallowed_prefixes
+        .iter()
+        .any(|prefix| candidate.starts_with(prefix))
+        || disallowed_suffixes
+            .iter()
+            .any(|suffix| candidate.ends_with(suffix))
+    {
+        return None;
+    }
+
+    Some(candidate.replace('-', "_"))
+}
+
+fn resolve_scaffold_backend(backend_override: Option<DatabaseBackend>) -> Result<DatabaseBackend> {
+    if let Some(backend) = backend_override {
+        return Ok(backend);
+    }
+
+    let database_url = std::env::var(DATABASE_URL_ENV).map_err(|_| {
+        anyhow!("table scaffolding requires `--backend` or `{DATABASE_URL_ENV}` to be set")
+    })?;
+
+    detect_backend(&database_url)
+}
+
+fn scaffold_table_migration(table_name: &str, backend: DatabaseBackend) -> String {
+    let table_name = quote_identifier(table_name, backend);
+
+    let body = match backend {
+        DatabaseBackend::Postgres => format!(
+            "CREATE TABLE {table_name} (\n    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP\n);"
+        ),
+        DatabaseBackend::MySql => format!(
+            "CREATE TABLE {table_name} (\n    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,\n    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\n    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\n);"
+        ),
+        DatabaseBackend::Sqlite => format!(
+            "CREATE TABLE {table_name} (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,\n    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\n);"
+        ),
+    };
+
+    format!("{UP_MARKER}\n\n{body}\n\n{DOWN_MARKER}\n\nDROP TABLE {table_name};\n")
+}
+
 async fn ensure_migration_table(conn: &mut AnyConnection) -> Result<()> {
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} (
@@ -683,8 +843,9 @@ fn checksum(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DOWN_MARKER, DatabaseBackend, UP_MARKER, detect_backend, parse_migration_sections,
-        quote_identifier, sanitize_migration_name,
+        DOWN_MARKER, DatabaseBackend, UP_MARKER, detect_backend, infer_table_name,
+        parse_migration_sections, quote_identifier, resolve_env_file_override,
+        sanitize_migration_name, scaffold_table_migration,
     };
 
     #[test]
@@ -760,5 +921,60 @@ mod tests {
             quote_identifier("main", DatabaseBackend::Sqlite),
             "\"main\""
         );
+    }
+
+    #[test]
+    fn infers_table_names_from_create_migrations() {
+        assert_eq!(infer_table_name("create-users"), Some("users".to_string()));
+        assert_eq!(
+            infer_table_name("create-users-table"),
+            Some("users".to_string())
+        );
+        assert_eq!(
+            infer_table_name("create-blog-posts"),
+            Some("blog_posts".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_non_table_create_migrations() {
+        assert_eq!(infer_table_name("create-index-users-email"), None);
+        assert_eq!(infer_table_name("create-users-email-index"), None);
+        assert_eq!(infer_table_name("create-view-active-users"), None);
+        assert_eq!(infer_table_name("alter-users"), None);
+    }
+
+    #[test]
+    fn scaffolds_postgres_table_migration() {
+        let sql = scaffold_table_migration("users", DatabaseBackend::Postgres);
+
+        assert!(sql.contains("GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"));
+        assert!(sql.contains("created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP"));
+        assert!(sql.contains("DROP TABLE \"users\";"));
+    }
+
+    #[test]
+    fn scaffolds_mysql_table_migration() {
+        let sql = scaffold_table_migration("users", DatabaseBackend::MySql);
+
+        assert!(sql.contains("AUTO_INCREMENT PRIMARY KEY"));
+        assert!(sql.contains("ON UPDATE CURRENT_TIMESTAMP"));
+        assert!(sql.contains("DROP TABLE `users`;"));
+    }
+
+    #[test]
+    fn resolves_env_file_from_split_flag() {
+        let args = vec!["dbrs", "--env-file", ".env.test", "migrate"];
+        let path = resolve_env_file_override(args).expect("env file should be found");
+
+        assert_eq!(path, std::path::PathBuf::from(".env.test"));
+    }
+
+    #[test]
+    fn resolves_env_file_from_equals_flag() {
+        let args = vec!["dbrs", "migrate", "--env-file=.env.local"];
+        let path = resolve_env_file_override(args).expect("env file should be found");
+
+        assert_eq!(path, std::path::PathBuf::from(".env.local"));
     }
 }
