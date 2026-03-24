@@ -12,12 +12,13 @@ use dotenvy::{dotenv, from_path};
 use sha2::{Digest, Sha256};
 use sqlx::{Any, AnyConnection, Connection, QueryBuilder, Row, any::install_default_drivers};
 
-const MIGRATION_TABLE: &str = "dbrs_migrations";
+const DEFAULT_MIGRATION_TABLE: &str = "dbrs_migrations";
 const UP_MARKER: &str = "-- dbrs:up";
 const DOWN_MARKER: &str = "-- dbrs:down";
 const MIGRATIONS_DIR_ENV: &str = "DBRS_MIGRATIONS_DIR";
 const DATABASE_URL_ENV: &str = "DATABASE_URL";
 const ENV_FILE_ENV: &str = "DBRS_ENV_FILE";
+const MIGRATION_TABLE_ENV: &str = "DBRS_MIGRATION_TABLE";
 
 #[derive(Parser, Debug)]
 #[command(name = "dbrs", about = "A small SQL migration tool", version)]
@@ -221,9 +222,10 @@ fn create_new_migration(
 async fn migrate(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
     let migrations = load_migrations(dir)?;
     let mut conn = connect(database_url).await?;
+    let migration_table = resolve_migration_table_name()?;
 
-    ensure_migration_table(&mut conn).await?;
-    let applied = load_applied_migrations(&mut conn).await?;
+    ensure_migration_table(&mut conn, &migration_table).await?;
+    let applied = load_applied_migrations(&mut conn, &migration_table).await?;
 
     let mut applied_now = 0usize;
 
@@ -238,7 +240,7 @@ async fn migrate(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
             continue;
         }
 
-        apply_migration(&mut conn, &migration).await?;
+        apply_migration(&mut conn, &migration_table, &migration).await?;
         applied_now += 1;
     }
 
@@ -259,10 +261,11 @@ async fn rollback(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
         .collect();
 
     let mut conn = connect(database_url).await?;
-    ensure_migration_table(&mut conn).await?;
+    let migration_table = resolve_migration_table_name()?;
+    ensure_migration_table(&mut conn, &migration_table).await?;
 
     let row = sqlx::query(&format!(
-        "SELECT version, checksum FROM {MIGRATION_TABLE} ORDER BY version DESC LIMIT 1"
+        "SELECT version, checksum FROM {migration_table} ORDER BY version DESC LIMIT 1"
     ))
     .fetch_optional(&mut conn)
     .await
@@ -287,7 +290,7 @@ async fn rollback(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
         );
     }
 
-    rollback_migration(&mut conn, migration).await?;
+    rollback_migration(&mut conn, &migration_table, migration).await?;
     println!("Rolled back {} ({})", migration.version, migration.name);
 
     Ok(())
@@ -296,9 +299,10 @@ async fn rollback(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
 async fn status(dir: Option<PathBuf>, database_url: &str) -> Result<()> {
     let migrations = load_migrations(dir)?;
     let mut conn = connect(database_url).await?;
+    let migration_table = resolve_migration_table_name()?;
 
-    ensure_migration_table(&mut conn).await?;
-    let applied = load_applied_migrations(&mut conn).await?;
+    ensure_migration_table(&mut conn, &migration_table).await?;
+    let applied = load_applied_migrations(&mut conn, &migration_table).await?;
 
     if migrations.is_empty() && applied.is_empty() {
         println!("No migrations found.");
@@ -617,9 +621,46 @@ fn scaffold_table_migration(table_name: &str, backend: DatabaseBackend) -> Strin
     format!("{UP_MARKER}\n\n{body}\n\n{DOWN_MARKER}\n\nDROP TABLE {table_name};\n")
 }
 
-async fn ensure_migration_table(conn: &mut AnyConnection) -> Result<()> {
+fn resolve_migration_table_name() -> Result<String> {
+    match std::env::var(MIGRATION_TABLE_ENV) {
+        Ok(value) => parse_migration_table_name(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MIGRATION_TABLE.to_string()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("`{MIGRATION_TABLE_ENV}` must be valid unicode")
+        }
+    }
+}
+
+fn parse_migration_table_name(value: Option<&str>) -> Result<String> {
+    match value {
+        Some(value) => {
+            validate_identifier(value)?;
+            Ok(value.to_string())
+        }
+        None => Ok(DEFAULT_MIGRATION_TABLE.to_string()),
+    }
+}
+
+fn validate_identifier(value: &str) -> Result<()> {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        bail!("migration table name cannot be empty");
+    };
+
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        bail!("migration table name must start with a letter or underscore");
+    }
+
+    if chars.any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_')) {
+        bail!("migration table name must contain only letters, numbers, and underscores");
+    }
+
+    Ok(())
+}
+
+async fn ensure_migration_table(conn: &mut AnyConnection, migration_table: &str) -> Result<()> {
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} (
+        "CREATE TABLE IF NOT EXISTS {migration_table} (
             version VARCHAR(255) PRIMARY KEY,
             name VARCHAR(255) NOT NULL,
             checksum VARCHAR(64) NOT NULL,
@@ -635,8 +676,11 @@ async fn ensure_migration_table(conn: &mut AnyConnection) -> Result<()> {
     Ok(())
 }
 
-async fn load_applied_migrations(conn: &mut AnyConnection) -> Result<HashMap<String, String>> {
-    let rows = sqlx::query(&format!("SELECT version, checksum FROM {MIGRATION_TABLE}"))
+async fn load_applied_migrations(
+    conn: &mut AnyConnection,
+    migration_table: &str,
+) -> Result<HashMap<String, String>> {
+    let rows = sqlx::query(&format!("SELECT version, checksum FROM {migration_table}"))
         .fetch_all(conn)
         .await
         .context("failed to read applied migrations")?;
@@ -652,7 +696,11 @@ async fn load_applied_migrations(conn: &mut AnyConnection) -> Result<HashMap<Str
     Ok(applied)
 }
 
-async fn apply_migration(conn: &mut AnyConnection, migration: &Migration) -> Result<()> {
+async fn apply_migration(
+    conn: &mut AnyConnection,
+    migration_table: &str,
+    migration: &Migration,
+) -> Result<()> {
     if migration.up_sql.is_empty() {
         bail!(
             "migration {} has an empty up section",
@@ -668,7 +716,7 @@ async fn apply_migration(conn: &mut AnyConnection, migration: &Migration) -> Res
         .with_context(|| format!("failed to apply migration {}", migration.path.display()))?;
 
     let mut query = QueryBuilder::<Any>::new(format!(
-        "INSERT INTO {MIGRATION_TABLE} (version, name, checksum) "
+        "INSERT INTO {migration_table} (version, name, checksum) "
     ));
     query.push("VALUES (");
     query.push_bind(&migration.version);
@@ -688,7 +736,11 @@ async fn apply_migration(conn: &mut AnyConnection, migration: &Migration) -> Res
     Ok(())
 }
 
-async fn rollback_migration(conn: &mut AnyConnection, migration: &Migration) -> Result<()> {
+async fn rollback_migration(
+    conn: &mut AnyConnection,
+    migration_table: &str,
+    migration: &Migration,
+) -> Result<()> {
     if migration.down_sql.is_empty() {
         bail!(
             "migration {} has an empty down section; cannot roll it back",
@@ -704,7 +756,7 @@ async fn rollback_migration(conn: &mut AnyConnection, migration: &Migration) -> 
         .with_context(|| format!("failed to roll back migration {}", migration.path.display()))?;
 
     let mut query =
-        QueryBuilder::<Any>::new(format!("DELETE FROM {MIGRATION_TABLE} WHERE version = "));
+        QueryBuilder::<Any>::new(format!("DELETE FROM {migration_table} WHERE version = "));
     query.push_bind(&migration.version);
 
     query.build().execute(&mut *tx).await.with_context(|| {
@@ -843,9 +895,10 @@ fn checksum(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DOWN_MARKER, DatabaseBackend, UP_MARKER, detect_backend, infer_table_name,
-        parse_migration_sections, quote_identifier, resolve_env_file_override,
-        sanitize_migration_name, scaffold_table_migration,
+        DEFAULT_MIGRATION_TABLE, DOWN_MARKER, DatabaseBackend, UP_MARKER, detect_backend,
+        infer_table_name, parse_migration_sections, parse_migration_table_name, quote_identifier,
+        resolve_env_file_override, sanitize_migration_name, scaffold_table_migration,
+        validate_identifier,
     };
 
     #[test]
@@ -976,5 +1029,34 @@ mod tests {
         let path = resolve_env_file_override(args).expect("env file should be found");
 
         assert_eq!(path, std::path::PathBuf::from(".env.local"));
+    }
+
+    #[test]
+    fn accepts_valid_migration_table_name() {
+        validate_identifier("migrations").expect("identifier should be valid");
+        validate_identifier("_migrations_2025").expect("identifier should be valid");
+    }
+
+    #[test]
+    fn rejects_invalid_migration_table_name() {
+        assert!(validate_identifier("123migrations").is_err());
+        assert!(validate_identifier("schema.migrations").is_err());
+        assert!(validate_identifier("migration-table").is_err());
+    }
+
+    #[test]
+    fn uses_default_migration_table_name() {
+        let name =
+            parse_migration_table_name(None).expect("default migration table should resolve");
+
+        assert_eq!(name, DEFAULT_MIGRATION_TABLE);
+    }
+
+    #[test]
+    fn uses_custom_migration_table_name_from_env() {
+        let name = parse_migration_table_name(Some("migrations"))
+            .expect("custom migration table should resolve");
+
+        assert_eq!(name, "migrations");
     }
 }
